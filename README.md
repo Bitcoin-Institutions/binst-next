@@ -40,7 +40,7 @@ node scripts/dev-proxy.mjs       # indexer proxy on :8787
 trunk serve --port 8090          # the app on http://localhost:8090
 ```
 
-`scripts/dev-proxy.mjs` runs `api/indexer.js` (the same function Vercel serves) when `UNISAT_API_KEY` is set, and otherwise forwards to a deployed proxy.
+`scripts/dev-proxy.mjs` runs `api/indexer.js` (the same function Vercel serves) when `UNISAT_API_KEY` is set. Without a key, set `INDEXER_UPSTREAM` to the origin of a deployed copy of this app and it forwards there.
 
 ## Layout
 

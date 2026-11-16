@@ -3,8 +3,9 @@
 //   node scripts/dev-proxy.mjs              (then `trunk serve` in another tab)
 //
 // With UNISAT_API_KEY in the environment it runs api/indexer.js itself, like
-// Vercel does. Without a key it forwards to the deployed proxy named in
-// INDEXER_UPSTREAM, because UniSat's keyless quota runs out within minutes.
+// Vercel does. Without a key, set INDEXER_UPSTREAM to the origin of a deployed
+// copy of this app and requests are forwarded to its /api/indexer; UniSat's
+// keyless quota runs out within minutes, so one of the two is needed.
 // FAIL=429 (or any status) makes every request fail, to test the error UI.
 
 import http from "node:http";
@@ -15,7 +16,7 @@ const handler = require("../api/indexer.js");
 
 const PORT = Number(process.env.PORT || 8787);
 const FAIL = process.env.FAIL ? Number(process.env.FAIL) : 0;
-const UPSTREAM = process.env.INDEXER_UPSTREAM || "https://binst-pilot-webapp.vercel.app";
+const UPSTREAM = (process.env.INDEXER_UPSTREAM || "").replace(/\/+$/, "");
 const local = Boolean(process.env.UNISAT_API_KEY);
 
 function vercelResponse(res) {
@@ -50,6 +51,10 @@ http
       vercelResponse(res).status(FAIL).json({ error: "forced failure (FAIL env)" });
       return;
     }
+    if (!local && !UPSTREAM) {
+      vercelResponse(res).status(502).json({ error: "dev proxy: set UNISAT_API_KEY or INDEXER_UPSTREAM" });
+      return;
+    }
     try {
       if (!local) {
         await forward(req, res);
@@ -66,5 +71,6 @@ http
     }
   })
   .listen(PORT, "127.0.0.1", () => {
-    console.log(`[dev-proxy] http://127.0.0.1:${PORT}/api/indexer/ → ${local ? "UniSat (local key)" : UPSTREAM}${FAIL ? ` · failing with ${FAIL}` : ""}`);
+    const target = local ? "UniSat (local key)" : UPSTREAM || "nothing: set UNISAT_API_KEY or INDEXER_UPSTREAM";
+    console.log(`[dev-proxy] http://127.0.0.1:${PORT}/api/indexer/ → ${target}${FAIL ? ` · failing with ${FAIL}` : ""}`);
   });

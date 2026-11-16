@@ -18,8 +18,9 @@ ignore = ["assets/vendor", "assets/js", "plan.md", "progress.md", "HANDOFF.md"]
 backend = "http://127.0.0.1:8787/api/indexer/"
 rewrite = "/api/indexer/"
 
-# REOWN_PROJECT_ID is substituted into the built index.html after each build
-# (window.__wcProjectId). The tracked index.html keeps the placeholder.
+# Substitutes REOWN_PROJECT_ID into the built index.html after each build.
+# WalletConnect is not ported yet, so index.html has no placeholder and the
+# hook does nothing for now.
 [[hooks]]
 stage = "post_build"
 command = "bash"
