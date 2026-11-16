@@ -1,0 +1,4 @@
+three 0.186.1 (MIT, see LICENSE), files unmodified.
+reused-from: diegobianqui-site@28cf1ae:node_modules/three/build/three.module.js (2026-11-16) — adapted: none
+reused-from: diegobianqui-site@28cf1ae:node_modules/three/build/three.core.js (2026-11-16) — adapted: none
+Upstream: https://www.npmjs.com/package/three/v/0.186.1

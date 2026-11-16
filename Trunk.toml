@@ -1,0 +1,26 @@
+[build]
+# Output directory for `trunk build`
+dist = "dist"
+
+[serve]
+port = 8090
+open = false
+
+# Copying these folders into dist makes the watcher on macOS see them as
+# changed, which rebuilds in a loop. Restart `trunk serve` after editing them.
+[watch]
+ignore = ["assets/vendor", "assets/js", "plan.md", "progress.md", "HANDOFF.md"]
+
+# The inscription indexer is reached same-origin at /api/indexer (a Vercel
+# function in production). In development, run `node scripts/dev-proxy.mjs`
+# and Trunk forwards the path to it.
+[[proxy]]
+backend = "http://127.0.0.1:8787/api/indexer/"
+rewrite = "/api/indexer/"
+
+# REOWN_PROJECT_ID is substituted into the built index.html after each build
+# (window.__wcProjectId). The tracked index.html keeps the placeholder.
+[[hooks]]
+stage = "post_build"
+command = "bash"
+command_arguments = ["scripts/inject-env.sh"]

@@ -1,0 +1,6 @@
+# reused-from: binst-pilot-webapp@dda2d1a:.cargo/config.toml (2026-11-16) — adapted: none (verbatim)
+[env]
+# Use Homebrew LLVM clang (supports wasm32 target, unlike Apple clang)
+# Required for secp256k1-sys C build to compile wasm.c
+CC_wasm32-unknown-unknown = "/opt/homebrew/opt/llvm/bin/clang"
+AR_wasm32-unknown-unknown = "/opt/homebrew/opt/llvm/bin/llvm-ar"

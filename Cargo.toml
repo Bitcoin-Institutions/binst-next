@@ -1,0 +1,74 @@
+[package]
+name = "binst-next"
+version = "0.1.0"
+edition = "2024"
+description = "BINST Next — prototype of a redesigned Bitcoin Institutions workflow (Rust/WASM)"
+license = "MIT"
+
+[lib]
+# rlib lets `cargo test` run the unit tests natively
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Protocol crates — git deps (overridden by [patch] below for local dev)
+binst-inscription = { git = "https://github.com/Bitcoin-Institutions/BINST-protocol.git" }
+binst-decoder     = { git = "https://github.com/Bitcoin-Institutions/BINST-protocol.git", default-features = false, features = ["wasm"] }
+serde = { version = "1", features = ["derive"] }
+
+wasm-bindgen = "0.2"
+serde_json = "1"
+web-sys = { version = "0.3", features = [
+  "Clipboard",
+  "CssStyleDeclaration",
+  "Document",
+  "DomRect",
+  "DomTokenList",
+  "Element",
+  "Headers",
+  "HtmlCollection",
+  "HtmlElement",
+  "HtmlInputElement",
+  "HtmlTextAreaElement",
+  "HtmlButtonElement",
+  "HtmlSelectElement",
+  "History",
+  "KeyboardEvent",
+  "Location",
+  "MessageEvent",
+  "Navigator",
+  "Node",
+  "NodeList",
+  "Request",
+  "RequestInit",
+  "RequestMode",
+  "Response",
+  "Window",
+  "Event",
+  "EventTarget",
+  "InputEvent",
+  "MouseEvent",
+  "PointerEvent",
+  "WheelEvent",
+  "WebSocket",
+  "CustomEvent",
+  "console",
+  "Storage",
+] }
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+bitcoin = { version = "0.32", features = ["serde", "base64"], default-features = false }
+html-escape = "0.2"
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdsa-core", "sha256"] }
+sha2 = "0.10"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = "s"     # optimise for size
+lto = true
+
+# ── Local development overrides ──────────────────────────────────
+# Redirect the git deps to the local checkout of binst-protocol.
+[patch."https://github.com/Bitcoin-Institutions/BINST-protocol.git"]
+binst-inscription = { path = "../../binst-protocol/crates/binst-inscription" }
+binst-decoder     = { path = "../../binst-protocol/crates/binst-decoder" }
+citrea-decoder    = { path = "../../binst-protocol/crates/citrea-decoder" }

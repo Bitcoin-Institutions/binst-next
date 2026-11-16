@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="BINST: institutions whose identity lives on Bitcoin. A pilot on Bitcoin testnet4 and Citrea testnet." />
+  <meta name="color-scheme" content="dark" />
+  <title>BINST — Bitcoin Institutions</title>
+  <link data-trunk rel="css" href="style.css" />
+  <link data-trunk rel="copy-dir" href="assets/js" />
+  <link data-trunk rel="copy-dir" href="assets/vendor" />
+  <!-- Sets the motion classes on <html> before first paint. -->
+  <script src="js/motion.js"></script>
+  <script type="importmap">
+    { "imports": { "three": "./vendor/three/three.module.js" } }
+  </script>
+</head>
+<body>
+  <a class="skip" href="#view">Skip to content</a>
+  <header id="topbar" class="topbar"></header>
+  <div id="ops" class="ops" aria-live="polite"></div>
+  <main id="view" tabindex="-1">
+    <noscript>This app needs JavaScript and WebAssembly.</noscript>
+  </main>
+  <aside id="sheet" class="sheet"></aside>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <footer class="footer">
+    <p>Pilot on Bitcoin testnet4 and Citrea testnet. Unaudited: use test coins only.</p>
+    <p><a href="https://github.com/Bitcoin-Institutions" target="_blank" rel="noopener noreferrer">Source on GitHub ↗</a></p>
+  </footer>
+  <script type="module">
+    // The 3D hero (three.js, about 2 MB unminified) is fetched only when the
+    // home page is on screen, the visitor allows motion and the browser is
+    // idle. Until then, and if it fails, the static tree stays.
+    const view = document.getElementById("view");
+    let asked = false;
+    const load = () => {
+      if (asked || !document.getElementById("hero-scene")) return;
+      if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+      asked = true;
+      const run = () => import("./js/hero.js").then((m) => m.start()).catch(() => {});
+      if (window.requestIdleCallback) requestIdleCallback(run, { timeout: 1500 });
+      else setTimeout(run, 200);
+    };
+    new MutationObserver(load).observe(view, { childList: true, subtree: true });
+    load();
+  </script>
+</body>
+</html>
