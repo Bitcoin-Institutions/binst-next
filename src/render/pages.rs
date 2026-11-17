@@ -17,12 +17,75 @@ pub fn view(state: &AppState) -> String {
             esc(&short(address))
         ),
         Route::New => create(state),
+        Route::Settings => settings(state),
         Route::Lab(page) => lab(state, page.as_deref()),
         Route::NotFound(path) => format!(
             r##"<section class="page narrow"><p class="kicker">Not found</p><h1>Nothing lives at this address</h1><p class="sub">“{}” is not a page of this app.</p><div class="actions"><a class="btn primary" href="#/">Go home</a><a class="btn" href="#/institutions">My institutions</a></div></section>"##,
             esc(path)
         ),
     }
+}
+
+// ── Settings ─────────────────────────────────────────────────────
+
+fn settings(state: &AppState) -> String {
+    let s = &state.settings;
+    let records = crate::recovery::list();
+    let keys = if records.is_empty() {
+        r#"<p class="empty">No one-time keys kept in this browser.</p>"#.to_string()
+    } else {
+        records
+            .iter()
+            .rev()
+            .map(|r| {
+                let status = if r.reveal_txid.is_empty() && !r.reveal_hex.is_empty() {
+                    "<strong>Reveal signed, not broadcast.</strong> Broadcast it again once the commit is out (copy it below, then <code>sendrawtransaction</code> on your node or mempool's Broadcast page), or import the descriptor to take the commit's sats back.".to_string()
+                } else if r.reveal_txid.is_empty() {
+                    "<strong>Reveal not broadcast.</strong> If the commit confirmed, import this descriptor to get its sats back.".to_string()
+                } else {
+                    format!("Revealed in <span class=\"mono\">{}</span>. Safe to forget once that is confirmed.", esc(&short(&r.reveal_txid)))
+                };
+                format!(
+                    r#"<li class="recovery"><div><strong>{}</strong> · commit <span class="mono">{}</span></div><p class="fineprint">{status}</p><div class="btn-row"><button class="btn small" data-act="copy" data-text="{}">Copy recovery descriptor</button>{}<button class="btn small" data-act="forget-recovery" data-id="{}" data-revealed="{}">Forget</button></div></li>"#,
+                    esc(&r.label),
+                    esc(&short(&r.commit_txid)),
+                    esc(&r.descriptor),
+                    if r.reveal_txid.is_empty() && !r.reveal_hex.is_empty() {
+                        format!(r#"<button class="btn small" data-act="copy" data-text="{}">Copy signed reveal</button>"#, esc(&r.reveal_hex))
+                    } else {
+                        String::new()
+                    },
+                    esc(&r.commit_txid),
+                    if r.reveal_txid.is_empty() { "0" } else { "1" },
+                )
+            })
+            .collect::<String>()
+    };
+    let wallet = match &state.btc {
+        Some(b) if b.is_handoff() => format!(
+            r#"<p class="sub">Bitcoin: <strong>{}</strong>, signing elsewhere. Address <span class="mono">{}</span>{}.</p>"#,
+            esc(&b.wallet_name),
+            esc(&b.address),
+            if b.origin.is_empty() { String::new() } else { format!(", key <span class=\"mono\">{}</span>", esc(&b.origin)) }
+        ),
+        Some(b) => format!(r#"<p class="sub">Bitcoin: <strong>{}</strong> (browser extension).</p>"#, esc(&b.wallet_name)),
+        None => String::new(),
+    };
+    format!(
+        r#"<section class="page narrow"><p class="kicker">Settings</p><h1>Your own servers</h1><p class="sub">Leave a field empty for the default. Everything here stays in this browser.</p>{wallet}
+<div class="card">
+<label class="field"><span>ord server <em>optional</em></span><input id="s-ord" type="url" placeholder="http://127.0.0.1:8080" value="{ord}" spellcheck="false"><small>Replaces the UniSat indexer for institution trees. Run <code>ord --testnet4 --index-addresses server</code>; ord already sends <code>Access-Control-Allow-Origin: *</code>. Default: UniSat through this site's <code>/api/indexer</code>.</small></label>
+<label class="field"><span>Chain API (esplora) <em>optional</em></span><input id="s-esplora" type="url" placeholder="{esplora_default}" value="{esplora}" spellcheck="false"><small>UTXOs, transactions, fees and broadcast. Your own mempool or esplora works; it must allow this site's origin (CORS). Browsers cannot reach an Electrum server directly.</small></label>
+<label class="field"><span>Citrea RPC <em>optional</em></span><input id="s-citrea" type="url" placeholder="https://rpc.testnet.citrea.xyz" value="{citrea}" spellcheck="false"><small>Reads only (instances, steps). Transactions still go through your Citrea wallet.</small></label>
+<div class="actions"><button class="btn primary" data-act="save-settings">Save</button></div>
+</div>
+<h2 class="section-title">One-time reveal keys</h2><p class="sub">Each inscription locks its commit output to a fresh key that only this browser holds, so your wallet never has to sign the inscription script. The key controls only that output (the reveal fee plus 546 sats). If a reveal never confirms, import the descriptor into Bitcoin Core (<code>importdescriptors</code>) or Sparrow to spend it back.</p>
+<ul class="recovery-list">{keys}</ul></section>"#,
+        ord = esc(&s.ord_url),
+        esplora = esc(&s.esplora_url),
+        esplora_default = crate::settings::DEFAULT_ESPLORA,
+        citrea = esc(&s.citrea_rpc),
+    )
 }
 
 // ── Home ─────────────────────────────────────────────────────────
@@ -250,7 +313,7 @@ fn create(state: &AppState) -> String {
                 ),
                 None => r#"<div class="fact"><dt>Signed and held by</dt><dd><button class="btn small" data-act="connect" data-layer="btc">Connect Bitcoin wallet</button></dd></div>"#.to_string(),
             };
-            let fee = if c.fee_rate > 0 { format!("{} sat/vB (mempool.space estimate)", c.fee_rate) } else { "estimating…".to_string() };
+            let fee = if c.fee_rate > 0 { format!("{} sat/vB (chain API estimate)", c.fee_rate) } else { "estimating…".to_string() };
             format!(
                 r#"<dl class="facts">
 <div class="fact"><dt>Name</dt><dd>{}</dd></div>
@@ -259,7 +322,7 @@ fn create(state: &AppState) -> String {
 {wallet}
 <div class="fact"><dt>Network</dt><dd>Bitcoin testnet4</dd></div>
 <div class="fact"><dt>Fee rate</dt><dd>{fee}</dd></div>
-<div class="fact"><dt>Signatures</dt><dd>2: the commit transaction, then the reveal</dd></div>
+<div class="fact"><dt>Signatures</dt><dd>1 in your wallet: the commit. The page signs the reveal with a one-time key (kept under Settings until you forget it).</dd></div>
 </dl>
 <p class="explain">Your wallet shows the exact amounts before you sign. The inscription lands at your address; holding it is what controls the institution.</p>
 {error}
@@ -472,7 +535,7 @@ mod tests {
         s.create.step = CreateStep::Review;
         s.create.name = "Acme".into();
         let html = view(&s);
-        assert!(html.contains("2: the commit transaction, then the reveal"));
+        assert!(html.contains("1 in your wallet: the commit"));
         assert!(html.contains("Connect wallet to continue"));
     }
 

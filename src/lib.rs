@@ -16,18 +16,26 @@
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
+mod account;
 mod actions;
 mod bip322;
 mod connect;
 mod featured;
+mod handoff;
 mod load;
 mod members;
 mod model;
 mod nostr;
+mod qr;
+mod recovery;
 mod relay;
+mod reveal;
+#[cfg(test)]
+mod reveal_regtest;
 mod render;
 mod router;
 mod session;
+mod settings;
 mod state;
 mod store;
 mod tree_layout;

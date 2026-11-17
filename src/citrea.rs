@@ -1,4 +1,4 @@
-// reused-from: binst-pilot-webapp@dda2d1a:src/citrea.rs (2026-11-16) — adapted: L2 address read from the session store instead of a hidden input
+// reused-from: binst-pilot-webapp@dda2d1a:src/citrea.rs (2026-11-16) — adapted: 2026-11-17 reads use the Citrea RPC from settings; L2 address read from the session store instead of a hidden input
 //! Citrea L2 (EVM) contract interaction layer.
 //!
 //! All `eth_sendTransaction` / `eth_call` logic lives here, keeping
@@ -180,7 +180,7 @@ async fn send_transaction(from: &str, to: &str, calldata: &str) -> Result<String
 /// Returns the full receipt as a `JsValue` (Object), or an error.
 async fn get_transaction_receipt(tx_hash: &str) -> Result<JsValue, String> {
     let l2_net = crate::storage::get_l2_network();
-    get_receipt_via_http(l2_net.rpc_url(), tx_hash).await
+    get_receipt_via_http(&crate::settings::citrea_rpc(l2_net), tx_hash).await
 }
 
 /// Parse the `InstanceCreated` event from a tx receipt to extract the instance address.
@@ -240,7 +240,7 @@ fn parse_instance_address_from_receipt(receipt: &JsValue) -> Result<String, Stri
 /// expose a public/localhost RPC that accepts `eth_call` over HTTP.
 async fn eth_call(to: &str, calldata: &str) -> Result<String, String> {
     let l2_net = crate::storage::get_l2_network();
-    eth_call_via_http(l2_net.rpc_url(), to, calldata).await
+    eth_call_via_http(&crate::settings::citrea_rpc(l2_net), to, calldata).await
 }
 
 /// Direct HTTP JSON-RPC `eth_call` — used for read-only queries when the
@@ -312,7 +312,8 @@ async fn eth_call_via_http(rpc_url: &str, to: &str, calldata: &str) -> Result<St
 /// Used for Citrea-specific endpoints like `citrea_getLastCommittedL2Height`.
 async fn citrea_rpc_call(method: &str, params: &str) -> Result<JsValue, String> {
     let l2_net = crate::storage::get_l2_network();
-    let rpc_url = l2_net.rpc_url();
+    let rpc_url = crate::settings::citrea_rpc(l2_net);
+    let rpc_url = rpc_url.as_str();
 
     let body = format!(
         r#"{{"jsonrpc":"2.0","method":"{}","params":[{}],"id":1}}"#,
@@ -477,7 +478,8 @@ pub async fn recover_instance_creation(
         );
 
         let l2_net = crate::storage::get_l2_network();
-        let rpc_url = l2_net.rpc_url();
+        let rpc_url = crate::settings::citrea_rpc(l2_net);
+    let rpc_url = rpc_url.as_str();
 
         let window = web_sys::window().ok_or("no window")?;
         let mut opts = web_sys::RequestInit::new();
@@ -537,7 +539,8 @@ pub async fn recover_instance_creation(
 /// Get the current L2 block number.
 async fn get_current_block_number() -> Result<u64, String> {
     let l2_net = crate::storage::get_l2_network();
-    let rpc_url = l2_net.rpc_url();
+    let rpc_url = crate::settings::citrea_rpc(l2_net);
+    let rpc_url = rpc_url.as_str();
     let body = r#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}"#;
 
     let window = web_sys::window().ok_or("no window")?;
@@ -584,7 +587,8 @@ pub async fn recover_step_executions(
 
     let current_block = get_current_block_number().await?;
     let l2_net = crate::storage::get_l2_network();
-    let rpc_url = l2_net.rpc_url();
+    let rpc_url = crate::settings::citrea_rpc(l2_net);
+    let rpc_url = rpc_url.as_str();
 
     let mut results: Vec<(u32, String, u64)> = Vec::new();
     let chunk = 999u64;

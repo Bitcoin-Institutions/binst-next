@@ -27,6 +27,39 @@ pub struct BtcSession {
     #[serde(default)]
     pub payment_address: String,
     pub wallet_name: String,
+    /// "" for a browser extension; "handoff" for a watch-only account whose
+    /// PSBTs are signed elsewhere (file, QR, Bitcoin Core).
+    #[serde(default)]
+    pub signer: String,
+    /// Key origin of `pubkey` for hand-off signers: `fp/86'/1'/0'/0/i`.
+    #[serde(default)]
+    pub origin: String,
+    /// The imported account descriptor (hand-off signers).
+    #[serde(default)]
+    pub account: String,
+}
+
+impl BtcSession {
+    pub fn is_handoff(&self) -> bool {
+        self.signer == "handoff"
+    }
+}
+
+/// A PSBT waiting for a signer outside the browser.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Handoff {
+    /// "commit" or "reveal".
+    pub step: String,
+    /// What is being inscribed, for the dialog title.
+    pub label: String,
+    pub psbt_b64: String,
+    pub format: crate::qr::QrFormat,
+    /// Why the last thing handed back was refused.
+    pub error: Option<String>,
+    /// What the scanner says when it starts; `None` when the camera is off.
+    /// Later progress is written straight into the dialog, so the video
+    /// element is not re-created mid-scan.
+    pub scanning: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -188,6 +221,12 @@ pub struct AppState {
     /// Institutions announced on Nostr relays: `(id, announced name)`.
     pub announced: Load<Vec<(String, String)>>,
     pub ops: Vec<Op>,
+    /// Chain data sources (user's own servers or the defaults).
+    pub settings: crate::settings::Settings,
+    /// Why the last account import failed.
+    pub import_error: Option<String>,
+    /// The PSBT hand-off dialog, while a signer outside the browser is needed.
+    pub handoff: Option<Handoff>,
     pub toasts: Vec<Toast>,
     /// Toasts raised during the current update, waiting for their expiry effect.
     new_toasts: Vec<u32>,
@@ -217,6 +256,9 @@ impl AppState {
             members_error: None,
             announced: Load::Idle,
             ops: Vec::new(),
+            settings: crate::settings::Settings::default(),
+            import_error: None,
+            handoff: None,
             toasts: Vec::new(),
             new_toasts: Vec::new(),
             next_id: 1,
@@ -297,6 +339,8 @@ pub enum Msg {
     BtcConnected(BtcSession),
     EvmConnected(EvmSession),
     ConnectFailed(String),
+    /// Use a watch-only Taproot account (descriptor) whose PSBTs are signed elsewhere.
+    ImportAccount { descriptor: String, index: u32 },
     Disconnect(Layer),
     SetPaymentAddress(String),
     RegistryRestored(Registry),
@@ -352,6 +396,17 @@ pub enum Msg {
     MembersFailed(String),
     ReloadAnnounced,
     AnnouncedLoaded(Result<Vec<(String, String)>, UserError>),
+
+    HandoffOpen { step: String, label: String, psbt_b64: String },
+    /// A signed PSBT or transaction handed back (pasted, loaded or scanned).
+    HandoffSubmit(Vec<u8>),
+    HandoffCancel,
+    HandoffFormat(crate::qr::QrFormat),
+    HandoffCamera(bool),
+
+    SettingsRestored(crate::settings::Settings),
+    SaveSettings(crate::settings::Settings),
+    ForgetRecovery(String),
 }
 
 /// What to do after the define form's fields were read.
@@ -390,6 +445,12 @@ pub enum Effect {
     PublishAward { institution: String, issuer: String, slug: String, member: String },
     PublishRevocations { institution: String, issuer: String, revoked: Vec<(String, String)> },
     ExpireToast(u32),
+    HandoffResolve(Vec<u8>),
+    HandoffReject,
+    StartCamera,
+    StopCamera,
+    SaveSettings,
+    ForgetRecovery(String),
 }
 
 const MAX_NAME: usize = 80;
@@ -428,6 +489,7 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
                     state.members_error = None;
                 }
                 Route::Instance { address } => fx.push(Effect::ResolveInstance(address.clone())),
+                Route::Settings => {}
                 Route::New => {
                     if state.create.step == CreateStep::Done {
                         state.create = CreateState::default();
@@ -482,6 +544,30 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             fx.push(Effect::SaveSessions);
         }
         Msg::ConnectFailed(why) => state.toast(ToastKind::Error, why),
+        Msg::ImportAccount { descriptor, index } => match crate::account::parse(&descriptor, index) {
+            Ok(account) => {
+                state.import_error = None;
+                let fp = account.origin.as_ref().map(|(fp, _)| fp.to_string());
+                let session = BtcSession {
+                    address: account.address,
+                    pubkey: account.internal.to_string(),
+                    provider_key: "handoff".to_string(),
+                    payment_address: String::new(),
+                    wallet_name: match fp {
+                        Some(fp) => format!("PSBT signer [{fp}]"),
+                        None => "PSBT signer".to_string(),
+                    },
+                    signer: "handoff".to_string(),
+                    origin: account.origin.as_ref().map(crate::account::origin_to_string).unwrap_or_default(),
+                    account: account.source,
+                };
+                if session.origin.is_empty() {
+                    state.toast(ToastKind::Info, "No key origin in that descriptor: Sparrow and Bitcoin Core can still sign, hardware signers may not");
+                }
+                fx.extend(update(state, Msg::BtcConnected(session)));
+            }
+            Err(why) => state.import_error = Some(why),
+        },
         Msg::Disconnect(Layer::Bitcoin) => {
             state.btc = None;
             state.mine = Load::Idle;
@@ -507,6 +593,91 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Effect> {
             state.btc = btc;
             state.evm = evm;
         }
+
+
+        // ── PSBT hand-off ────────────────────────────────────────
+        Msg::HandoffOpen { step, label, psbt_b64 } => {
+            state.handoff = Some(Handoff {
+                step,
+                label,
+                psbt_b64,
+                format: crate::qr::QrFormat::Ur,
+                error: None,
+                scanning: None,
+            });
+        }
+        Msg::HandoffSubmit(bytes) => {
+            if let Some(h) = state.handoff.as_mut() {
+                let original = bitcoin::base64::Engine::decode(&bitcoin::base64::engine::general_purpose::STANDARD, &h.psbt_b64)
+                    .ok()
+                    .and_then(|b| bitcoin::psbt::Psbt::deserialize(&b).ok());
+                let checked = original
+                    .ok_or_else(|| "The PSBT sent out could not be read back".to_string())
+                    .and_then(|orig| crate::reveal::merge_signed(&orig, &bytes).map(|m| (orig, m)));
+                match checked {
+                    Ok((_, mut merged)) => {
+                        crate::reveal::finalize_key_path_inputs(&mut merged);
+                        let missing = crate::reveal::unsigned_inputs(&merged);
+                        let verified = if missing.is_empty() { crate::reveal::verify_key_path_signatures(&merged) } else { Ok(()) };
+                        if let Err(why) = verified {
+                            h.error = Some(why);
+                        } else if missing.is_empty() {
+                            let was_scanning = h.scanning.is_some();
+                            state.handoff = None;
+                            if was_scanning {
+                                fx.push(Effect::StopCamera);
+                            }
+                            fx.push(Effect::HandoffResolve(bytes));
+                        } else {
+                            h.error = Some(format!(
+                                "That PSBT is not signed yet (input {missing:?} has no signature). Sign it, then hand back the signed file."
+                            ));
+                        }
+                    }
+                    Err(why) => h.error = Some(why),
+                }
+            }
+        }
+        Msg::HandoffCancel => {
+            if let Some(h) = state.handoff.take() {
+                if h.scanning.is_some() {
+                    fx.push(Effect::StopCamera);
+                }
+                fx.push(Effect::HandoffReject);
+            }
+        }
+        Msg::HandoffFormat(format) => {
+            if let Some(h) = state.handoff.as_mut() {
+                h.format = format;
+            }
+        }
+        Msg::HandoffCamera(on) => {
+            if let Some(h) = state.handoff.as_mut() {
+                if on && h.scanning.is_none() {
+                    h.scanning = Some("Starting the camera…".to_string());
+                    fx.push(Effect::StartCamera);
+                } else if !on && h.scanning.is_some() {
+                    h.scanning = None;
+                    fx.push(Effect::StopCamera);
+                }
+            }
+        }
+        // ── Settings ─────────────────────────────────────────────
+        Msg::SettingsRestored(settings) => state.settings = settings,
+        Msg::SaveSettings(settings) => match settings.normalized() {
+            Ok(settings) => {
+                let indexer_changed = settings.ord_url != state.settings.ord_url;
+                state.settings = settings;
+                fx.push(Effect::SaveSettings);
+                state.toast(ToastKind::Success, "Settings saved");
+                if indexer_changed {
+                    state.trees.clear();
+                    state.mine = Load::Idle;
+                }
+            }
+            Err(why) => state.toast(ToastKind::Error, why),
+        },
+        Msg::ForgetRecovery(commit_txid) => fx.push(Effect::ForgetRecovery(commit_txid)),
 
         // ── Trees ────────────────────────────────────────────────
         Msg::ReloadTree(id) => {

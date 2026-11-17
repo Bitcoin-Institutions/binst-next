@@ -55,11 +55,12 @@ fn wallet_pill(layer: Layer, address: Option<&str>, wallet: &str, warn: bool) ->
 pub fn topbar(state: &AppState) -> String {
     let evm_warn = state.evm.as_ref().is_some_and(|e| e.network != "citrea-testnet" && e.network != "hardhat-local");
     format!(
-        r##"<a class="brand" href="#/" aria-label="BINST home"><span class="brand-mark">₿</span><span class="brand-name">BINST</span><span class="brand-tag">pilot</span></a><nav class="nav" aria-label="Main">{}{}{}{}</nav><div class="wallets" aria-label="Wallets">{}{}</div>"##,
+        r##"<a class="brand" href="#/" aria-label="BINST home"><span class="brand-mark">₿</span><span class="brand-name">BINST</span><span class="brand-tag">pilot</span></a><nav class="nav" aria-label="Main">{}{}{}{}{}</nav><div class="wallets" aria-label="Wallets">{}{}</div>"##,
         nav_link(&Route::Home, &state.route, "Home"),
         nav_link(&Route::Institutions, &state.route, "My institutions"),
         nav_link(&Route::New, &state.route, "Create"),
         nav_link(&Route::Lab(None), &state.route, "Lab"),
+        nav_link(&Route::Settings, &state.route, "Settings"),
         wallet_pill(
             Layer::Bitcoin,
             state.btc.as_ref().map(|b| b.address.as_str()),
@@ -126,7 +127,7 @@ fn wallet_icon(svg: String, url: Option<&str>, fallback: &str) -> String {
 }
 
 /// The one place to connect: a dialog with a tab per layer.
-pub fn picker(layer: Layer, btc: &[BtcCandidate], evm: &[EvmCandidate], walletconnect: bool) -> String {
+pub fn picker(layer: Layer, btc: &[BtcCandidate], evm: &[EvmCandidate], walletconnect: bool, import_error: Option<&str>) -> String {
     let tab = |l: Layer, label: &str| {
         format!(
             r#"<button role="tab" class="tab{}" aria-selected="{}" data-act="connect" data-layer="{}">{label}</button>"#,
@@ -178,10 +179,26 @@ pub fn picker(layer: Layer, btc: &[BtcCandidate], evm: &[EvmCandidate], walletco
     } else {
         format!(r#"<div class="wallet-list">{list}{wc}</div>"#)
     };
+    let body = if layer == Layer::Bitcoin { format!("{body}{}", sign_elsewhere(import_error)) } else { body };
     format!(
         r#"<div class="backdrop" data-act="close-picker"></div><div class="modal" role="dialog" aria-modal="true" aria-labelledby="picker-title"><header class="modal-head"><h2 id="picker-title">Connect a wallet</h2><button class="icon-btn" data-act="close-picker" aria-label="Close">×</button></header><div class="tabs" role="tablist">{}{}</div><p class="tab-help">{help}</p>{body}<p class="fineprint">Test networks only. This pilot is unaudited: use test coins.</p></div>"#,
         tab(Layer::Bitcoin, "Bitcoin · testnet4"),
         tab(Layer::Citrea, "Citrea · testnet"),
+    )
+}
+
+/// The picker's "sign elsewhere" section: a watch-only account whose PSBTs
+/// are signed by the user's own software or hardware.
+fn sign_elsewhere(error: Option<&str>) -> String {
+    let open = if error.is_some() { " open" } else { "" };
+    let error = error.map(|e| format!(r#"<p class="form-error" role="alert">{}</p>"#, esc(e))).unwrap_or_default();
+    format!(
+        r#"<details class="elsewhere"{open}><summary><span class="wallet-fallback">⎘</span><span class="wallet-name">Sign elsewhere</span><span class="wallet-sub">Sparrow, Bitcoin Core, Electrum, Coldcard, Keystone, Passport, SeedSigner, Jade</span></summary>
+<p class="tab-help">No extension needed. Paste your Taproot account's descriptor (public keys only). The page builds each PSBT; you sign it in your own wallet by file, QR or a Bitcoin Core command, and hand it back.</p>
+<label class="field"><span>Account descriptor</span><textarea id="acct-desc" rows="3" spellcheck="false" autocomplete="off" placeholder="tr([fingerprint/86'/1'/0']tpub…/0/*)"></textarea></label>
+<label class="field field--short"><span>Address index</span><input id="acct-index" inputmode="numeric" value="0"></label>
+<p class="fineprint"><strong>Sparrow:</strong> Settings → Script Policy → copy the descriptor. <strong>Bitcoin Core:</strong> <code>listdescriptors</code>, the <code>tr(…/0/*)</code> entry. <strong>Coldcard:</strong> Advanced → Export Wallet → Descriptor. The account must be on testnet4 (tpub, coin type 1').</p>
+{error}<button class="btn primary" data-act="import-account">Use this account</button></details>"#,
     )
 }
 
@@ -214,7 +231,7 @@ mod tests {
 
     #[test]
     fn picker_shows_the_tab_help_and_an_empty_state() {
-        let html = picker(Layer::Bitcoin, &[], &[], false);
+        let html = picker(Layer::Bitcoin, &[], &[], false, None);
         assert!(html.contains("No Bitcoin wallet found"));
         assert!(html.contains(r#"aria-selected="true" data-act="connect" data-layer="btc""#));
         let html = picker(
@@ -222,8 +239,10 @@ mod tests {
             &[BtcCandidate { key: "unisat".into(), name: "UniSat <b>".into(), icon: None }],
             &[],
             false,
+            Some("bad descriptor"),
         );
         assert!(html.contains(r#"data-act="pick-btc" data-key="unisat""#));
+        assert!(html.contains("Sign elsewhere") && html.contains("bad descriptor"));
         assert!(html.contains("UniSat &lt;b&gt;"));
     }
 

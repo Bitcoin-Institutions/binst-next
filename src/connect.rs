@@ -49,6 +49,7 @@ fn read<T: for<'de> Deserialize<'de>>(key: &str) -> Option<T> {
 /// Sessions show at once and are then checked against the wallets without
 /// prompting; one that no longer matches is dropped.
 pub fn restore() {
+    dispatch(Msg::SettingsRestored(crate::settings::load()));
     if let Some(registry) = read::<Registry>(REGISTRY_KEY) {
         dispatch(Msg::RegistryRestored(registry));
     }
@@ -80,6 +81,9 @@ pub fn restore() {
 /// A stored Bitcoin session is kept when its provider is still injected and,
 /// for wallets that can say so without a prompt, still reports the address.
 async fn btc_session_still_valid(session: &BtcSession) -> bool {
+    if session.is_handoff() {
+        return true; // a watch-only account has no provider to check
+    }
     let Some(provider) = wallet::resolve_btc_provider(&session.provider_key) else { return false };
     let Some(get_accounts) = function(&provider, "getAccounts") else { return true };
     let Ok(value) = get_accounts.call0(&provider) else { return true };
@@ -123,6 +127,7 @@ pub async fn connect_btc(key: String, name: String) {
                 provider_key: key,
                 payment_address: String::new(),
                 wallet_name: name,
+                ..Default::default()
             }));
         }
         Err(why) => dispatch(Msg::ConnectFailed(friendly(&why))),

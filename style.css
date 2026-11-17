@@ -471,3 +471,40 @@ html.fx.jsfx .reveal.in { opacity: 1; transform: none; }
 .rejected summary { cursor: pointer; color: var(--warn); }
 .rejected ul { margin: 8px 0 0 18px; display: grid; gap: 4px; overflow-wrap: anywhere; }
 .page > .progress, .page > .form-error { margin: 0 0 4px; }
+
+/* ── Sign elsewhere (picker) and PSBT hand-off ───────────────── */
+
+.elsewhere { margin-top: 10px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+.elsewhere > summary { display: grid; grid-template-columns: 28px 1fr; column-gap: 12px; align-items: center; padding: 11px 14px; cursor: pointer; list-style: none; }
+.elsewhere > summary::-webkit-details-marker { display: none; }
+.elsewhere > summary > :first-child { grid-row: span 2; }
+.elsewhere[open] > summary { border-bottom: 1px solid var(--border); }
+.elsewhere > :not(summary) { margin-left: 14px; margin-right: 14px; }
+.elsewhere > .btn { margin-bottom: 14px; margin-top: 12px; }
+.field textarea, .field input { font-family: var(--mono); font-size: 12.5px; }
+.field--short input { max-width: 120px; }
+
+.modal--wide { width: min(980px, calc(100vw - 24px)); }
+.modal-foot { display: flex; justify-content: flex-end; margin-top: 16px; }
+.handoff-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+.handoff-grid h3 { font-size: 15px; margin-bottom: 10px; }
+.btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.btn-row label.btn { display: inline-flex; align-items: center; }
+.handoff-qr { margin-top: 12px; }
+.handoff-qr .tabs { max-width: 220px; }
+.qr-stage { margin-top: 10px; width: 280px; max-width: 100%; aspect-ratio: 1; background: #fff; border-radius: 12px; padding: 6px; }
+.qr-frame svg { width: 100%; height: auto; display: block; }
+.qr-frame[hidden] { display: none; }
+pre.code { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 120px; overflow-y: auto; background: #0a0a10; border: 1px solid var(--border); border-radius: 10px; padding: 10px; font-size: 11.5px; margin: 8px 0; }
+details > summary { cursor: pointer; }
+.scanner { display: grid; gap: 8px; margin-top: 10px; }
+.scanner video { width: 100%; max-height: 260px; background: #000; border-radius: 12px; object-fit: cover; }
+
+.section-title { font-size: 20px; margin-top: 32px; }
+.recovery-list { list-style: none; padding: 0; display: grid; gap: 10px; margin-top: 12px; }
+.recovery { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; }
+
+@media (max-width: 760px) {
+  .handoff-grid { grid-template-columns: 1fr; }
+  .qr-stage { margin-left: auto; margin-right: auto; }
+}
