@@ -13,17 +13,25 @@ use crate::state::{LocalDefinition, LocalInstitution, Msg, OpStage};
 use crate::store::dispatch;
 use crate::wallet::get_connected_pubkey;
 
-const MEMPOOL_BASE: &str = "https://mempool.space/testnet4/api";
 /// Used when the fee estimate cannot be fetched.
 const FALLBACK_FEE_RATE: u64 = 2;
 
 pub async fn fetch_fee_rate() {
-    let rate = fetch_json(&format!("{MEMPOOL_BASE}/v1/fees/recommended"))
+    let base = crate::settings::esplora_base();
+    // mempool's endpoint first; plain esplora only has /fee-estimates.
+    let mempool = fetch_json(&format!("{base}/v1/fees/recommended"))
         .await
         .ok()
-        .and_then(|v| v.get("halfHourFee").and_then(|f| f.as_u64()))
-        .unwrap_or(FALLBACK_FEE_RATE);
-    dispatch(Msg::FeeRate(rate));
+        .and_then(|v| v.get("halfHourFee").and_then(|f| f.as_u64()));
+    let rate = match mempool {
+        Some(rate) => Some(rate),
+        None => fetch_json(&format!("{base}/fee-estimates"))
+            .await
+            .ok()
+            .and_then(|v| v.get("3").and_then(|f| f.as_f64()))
+            .map(|f| f.ceil().max(1.0) as u64),
+    };
+    dispatch(Msg::FeeRate(rate.unwrap_or(FALLBACK_FEE_RATE)));
 }
 
 // ── Bitcoin: institution ─────────────────────────────────────────
@@ -47,7 +55,7 @@ pub async fn inscribe_institution(name: String, description: String, website: St
         website: (!website.is_empty()).then(|| website.clone()),
         vault,
     });
-    dispatch(Msg::CreateProgress("Waiting for your wallet: sign the commit, then the reveal.".to_string()));
+    dispatch(Msg::CreateProgress("Waiting for your wallet to sign the commit. The page signs the reveal with a one-time key.".to_string()));
     match inscribe_serverless(&entity, fee_rate, None, None).await {
         Ok(result) => dispatch(Msg::CreateDone(LocalInstitution {
             id: result.inscription_id,
@@ -85,7 +93,7 @@ pub async fn inscribe_definition(institution: String, name: String, description:
             .map(|s| StepDef { name: s.name.clone(), action_type: Some(s.action.clone()) })
             .collect(),
     });
-    dispatch(Msg::DefineProgress("Waiting for your wallet: sign the commit, then the reveal.".to_string()));
+    dispatch(Msg::DefineProgress("Waiting for your wallet: sign the commit, then the institution's input in the reveal.".to_string()));
     match inscribe_serverless(&entity, fee_rate, Some(&institution), Some(parent_utxo)).await {
         Ok(result) => dispatch(Msg::DefineDone(LocalDefinition {
             id: result.inscription_id,
@@ -106,7 +114,7 @@ pub async fn poll_confirmation(op: u32, txid: String) {
     loop {
         sleep_ms(&window, 15_000).await;
         // mempool.space answers unknown txids with plain text, not JSON.
-        let Ok(text) = fetch_text(&format!("{MEMPOOL_BASE}/tx/{txid}/status")).await else { continue };
+        let Ok(text) = fetch_text(&format!("{}/tx/{txid}/status", crate::settings::esplora_base())).await else { continue };
         let Ok(status) = serde_json::from_str::<serde_json::Value>(&text) else {
             misses += 1;
             if misses >= 8 {

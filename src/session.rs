@@ -30,3 +30,13 @@ pub fn l2_address() -> String {
 pub fn set_l1_payment_address(address: &str) {
     store::dispatch(Msg::SetPaymentAddress(address.to_string()));
 }
+
+/// True when the Bitcoin session signs elsewhere (PSBT hand-off).
+pub fn l1_is_handoff() -> bool {
+    store::with(|s| s.btc.as_ref().is_some_and(|b| b.is_handoff()))
+}
+
+/// Key origin of the session's key, for PSBT derivation fields.
+pub fn l1_origin() -> Option<(bitcoin::bip32::Fingerprint, bitcoin::bip32::DerivationPath)> {
+    store::with(|s| s.btc.as_ref().and_then(|b| crate::account::origin_from_string(&b.origin)))
+}

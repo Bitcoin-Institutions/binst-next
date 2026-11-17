@@ -55,7 +55,7 @@ fn institution(state: &AppState, tree: &Tree) -> String {
         ));
     }
     if !inst.admin.is_empty() {
-        body.push_str(&fact("Admin key", &copyable(&inst.admin, &short(&inst.admin))));
+        body.push_str(&fact("Admin key (declared)", &copyable(&inst.admin, &short(&inst.admin))));
     }
     if inst.website.starts_with("https://") {
         body.push_str(&fact("Website", &ext_link(&esc(&inst.website), &inst.website)));
@@ -76,7 +76,7 @@ fn institution(state: &AppState, tree: &Tree) -> String {
         body.push_str(&format!(
             r#"<div class="actions"><button class="btn primary" data-act="define-open" data-inst="{inst_id}">Define a process</button></div>"#
         ));
-        body.push_str(&needs("btc", "Two signatures: commit and reveal."));
+        body.push_str(&needs("btc", "Two signatures: the commit, then the institution's input in the reveal."));
     } else if state.btc.is_some() {
         body.push_str(&format!(
             r#"<div class="actions"><button class="btn" disabled>Define a process</button></div>{}"#,
@@ -226,7 +226,7 @@ pub fn define_form(state: &AppState, draft: &DefineDraft) -> String {
         esc(&name),
         esc(&draft.name),
         esc(&draft.description),
-        needs("btc", "Two signatures: commit and reveal."),
+        needs("btc", "Two signatures: the commit, then the institution's input in the reveal."),
     );
     panel("New process definition", "Define a process", &body)
 }

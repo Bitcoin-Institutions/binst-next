@@ -6,6 +6,7 @@
 
 pub mod common;
 pub mod detail;
+pub mod handoff;
 pub mod icons;
 pub mod members;
 pub mod pages;
@@ -17,6 +18,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{Document, Element, HtmlInputElement, HtmlSelectElement, HtmlTextAreaElement};
 
 use crate::model::{Layer, NodeRef, Step};
+use crate::qr::QrFormat;
 use crate::state::{AppState, DefineThen, Msg, ToastKind};
 use crate::store::{self, dispatch};
 
@@ -36,6 +38,9 @@ fn put(document: &Document, id: &str, html: &str) {
 }
 
 fn sheet(state: &AppState) -> String {
+    if let Some(h) = &state.handoff {
+        return handoff::dialog(h);
+    }
     if let Some(layer) = state.picker {
         let btc: Vec<shell::BtcCandidate> = crate::wallet::detect_all_btc_providers()
             .into_iter()
@@ -45,7 +50,7 @@ fn sheet(state: &AppState) -> String {
         let walletconnect = web_sys::window()
             .and_then(|w| js_sys::Reflect::get(&w, &JsValue::from_str("__wc")).ok())
             .is_some_and(|wc| !wc.is_undefined() && !wc.is_null());
-        return shell::picker(layer, &btc, &evm, walletconnect);
+        return shell::picker(layer, &btc, &evm, walletconnect, state.import_error.as_deref());
     }
     if let Some(draft) = &state.define {
         return detail::define_form(state, draft);
@@ -84,6 +89,7 @@ fn page_title(state: &AppState) -> String {
         }
         Route::Instance { .. } => "Instance".to_string(),
         Route::New => "Create an institution".to_string(),
+        Route::Settings => "Settings".to_string(),
         Route::Lab(_) => "Lab".to_string(),
         Route::NotFound(_) => "Not found".to_string(),
     };
@@ -206,6 +212,37 @@ fn message_for(document: &Document, el: &Element) -> Option<Msg> {
             member: attr(el, "data-member"),
             revoked: act == "revoke-role",
         },
+        "import-account" => Msg::ImportAccount {
+            descriptor: input_value(document, "acct-desc"),
+            index: input_value(document, "acct-index").trim().parse().unwrap_or(0),
+        },
+        "handoff-cancel" => Msg::HandoffCancel,
+        "handoff-format" => Msg::HandoffFormat(if attr(el, "data-format") == "bbqr" { QrFormat::Bbqr } else { QrFormat::Ur }),
+        "handoff-camera" => Msg::HandoffCamera(attr(el, "data-on") == "1"),
+        "handoff-paste" => Msg::HandoffSubmit(input_value(document, "handoff-in").into_bytes()),
+        "handoff-download" => {
+            let (step, b64) = store::with(|s| s.handoff.as_ref().map(|h| (h.step.clone(), h.psbt_b64.clone())))?;
+            let bytes = bitcoin::base64::Engine::decode(&bitcoin::base64::engine::general_purpose::STANDARD, &b64).ok()?;
+            let name = format!("binst-{step}.psbt");
+            crate::handoff::download(&name, &bytes, "application/octet-stream");
+            Msg::Toast(ToastKind::Info, format!("Saved {name}. Sign it, then load the signed file here."))
+        }
+        "save-settings" => Msg::SaveSettings(crate::settings::Settings {
+            ord_url: input_value(document, "s-ord"),
+            esplora_url: input_value(document, "s-esplora"),
+            citrea_rpc: input_value(document, "s-citrea"),
+        }),
+        "forget-recovery" => {
+            if attr(el, "data-revealed") != "1" {
+                let ok = web_sys::window()
+                    .and_then(|w| w.confirm_with_message("This reveal was never broadcast. Forgetting the key loses the commit output's sats unless you copied the descriptor. Forget it?").ok())
+                    .unwrap_or(false);
+                if !ok {
+                    return None;
+                }
+            }
+            Msg::ForgetRecovery(id)
+        }
         "start-instance" => Msg::StartInstance { institution: inst, definition: id },
         "execute-step" => Msg::ExecuteStep { institution: inst, definition: attr(el, "data-def"), address: id },
         _ => return None,
@@ -266,4 +303,24 @@ pub fn mount() {
     }) as Box<dyn Fn(web_sys::KeyboardEvent)>);
     document.add_event_listener_with_callback("keydown", on_key.as_ref().unchecked_ref()).ok();
     on_key.forget();
+
+    // File inputs (the hand-off dialog's "Load a .psbt file").
+    let on_change = Closure::wrap(Box::new(move |event: web_sys::Event| {
+        let Some(input) = event.target().and_then(|t| t.dyn_into::<HtmlInputElement>().ok()) else { return };
+        if input.get_attribute("data-change").as_deref() == Some("handoff-file") {
+            crate::handoff::read_file(&input);
+            input.set_value("");
+        }
+    }) as Box<dyn Fn(web_sys::Event)>);
+    document.add_event_listener_with_callback("change", on_change.as_ref().unchecked_ref()).ok();
+    on_change.forget();
+
+    // Animated QR: advance the visible frame (a no-op when none is shown).
+    let tick = Closure::wrap(Box::new(crate::handoff::tick_qr) as Box<dyn Fn()>);
+    if let Some(window) = web_sys::window() {
+        window
+            .set_interval_with_callback_and_timeout_and_arguments_0(tick.as_ref().unchecked_ref(), 400)
+            .ok();
+    }
+    tick.forget();
 }

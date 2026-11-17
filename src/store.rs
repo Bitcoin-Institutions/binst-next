@@ -79,6 +79,15 @@ fn run(effect: Effect) {
         Effect::PublishRevocations { institution, issuer, revoked } => {
             spawn(crate::members::publish_revocations(institution, issuer, revoked))
         }
+        Effect::HandoffResolve(bytes) => crate::handoff::resolve(&bytes),
+        Effect::HandoffReject => crate::handoff::reject(),
+        Effect::StartCamera => crate::handoff::start_camera(),
+        Effect::StopCamera => crate::handoff::stop_camera(),
+        Effect::SaveSettings => crate::settings::save(),
+        Effect::ForgetRecovery(commit_txid) => {
+            crate::recovery::forget(&commit_txid);
+            crate::render::render();
+        }
         Effect::ExpireToast(id) => spawn(async move {
             if let Some(window) = web_sys::window() {
                 crate::fetch::sleep_ms(&window, 7_000).await;

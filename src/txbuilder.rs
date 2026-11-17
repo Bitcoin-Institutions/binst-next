@@ -1,4 +1,4 @@
-// reused-from: binst-pilot-webapp@dda2d1a:src/txbuilder.rs (2026-11-16) — adapted: none (verbatim)
+// reused-from: binst-pilot-webapp@dda2d1a:src/txbuilder.rs (2026-11-16) — adapted: 2026-11-17 the reveal leaf and internal key are a one-time reveal key (ord's layout) instead of the admin key over NUMS; the parent tag encodes the index
 //! Transaction builder — construct commit/reveal inscription transactions
 //! and export unsigned PSBTs for wallet-agnostic signing.
 //!
@@ -6,7 +6,7 @@
 
 use bitcoin::blockdata::opcodes::all::*;
 use bitcoin::blockdata::script::Builder as ScriptBuilder;
-use bitcoin::key::{UntweakedPublicKey, XOnlyPublicKey};
+use bitcoin::key::XOnlyPublicKey;
 use bitcoin::opcodes;
 use bitcoin::psbt::Psbt;
 use bitcoin::secp256k1::Secp256k1;
@@ -25,11 +25,6 @@ const DUST_LIMIT: u64 = 546;
 
 /// Maximum single push in Tapscript (520 bytes).
 const MAX_PUSH: usize = 520;
-
-/// NUMS point — provably unspendable internal key (BIP-341 recommended).
-/// H = lift_x(SHA256("BINST/nums"))  — we use the standard nothing-up-my-sleeve point.
-const NUMS_POINT_HEX: &str =
-    "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -80,7 +75,7 @@ impl InscriptionPlan {
 ///
 /// Layout (Ordinals standard):
 /// ```text
-/// <admin_pubkey> OP_CHECKSIG
+/// <reveal_key> OP_CHECKSIG
 /// OP_FALSE OP_IF
 ///   OP_PUSH "ord"
 ///   OP_PUSH 3  OP_PUSH <parent_txid_bytes>   ← only present when parent is set
@@ -102,7 +97,7 @@ impl InscriptionPlan {
 /// bytes are reversed (little-endian) before being pushed, as per the Ordinals
 /// spec.
 pub fn build_inscription_script(
-    admin_pubkey: &XOnlyPublicKey,
+    reveal_key: &XOnlyPublicKey,
     entity: &BinstEntity,
     parent_inscription_id: Option<&str>,
 ) -> Result<ScriptBuf, String> {
@@ -121,7 +116,7 @@ pub fn build_inscription_script(
         .map_err(|e| format!("JSON serialize error: {e}"))?;
 
     let mut b = ScriptBuilder::new()
-        .push_x_only_key(admin_pubkey)
+        .push_x_only_key(reveal_key)
         .push_opcode(OP_CHECKSIG)
         .push_opcode(opcodes::OP_FALSE)
         .push_opcode(OP_IF);
@@ -132,16 +127,8 @@ pub fn build_inscription_script(
     // Tag 3: parent (optional) — txid bytes reversed (little-endian), stripped
     // of the trailing `i<vout>` suffix before encoding.
     if let Some(parent_id) = parent_inscription_id {
-        let txid_hex = parent_id.split('i').next().unwrap_or(parent_id);
-        if txid_hex.len() == 64 {
-            let mut txid_bytes = (0..32)
-                .map(|i| u8::from_str_radix(&txid_hex[i * 2..i * 2 + 2], 16))
-                .collect::<Result<Vec<u8>, _>>()
-                .map_err(|e| format!("Invalid parent txid hex: {e}"))?;
-            txid_bytes.reverse(); // Ordinals spec: little-endian
-            b = b.push_int(3);
-            b = push_bytes_checked(b, &txid_bytes)?;
-        }
+        b = b.push_int(3);
+        b = push_bytes_checked(b, &parent_tag_value(parent_id)?)?;
     }
 
     // Tag 1: content type
@@ -165,6 +152,27 @@ pub fn build_inscription_script(
     Ok(b.into_script())
 }
 
+/// Value of the parent tag (3) for `<txid>i<index>`: the txid's 32 bytes in
+/// little-endian order, then the index as 4 little-endian bytes with trailing
+/// zero bytes dropped (so index 0 adds nothing), as ord encodes it.
+pub fn parent_tag_value(parent_id: &str) -> Result<Vec<u8>, String> {
+    let (txid_hex, index) = parent_id
+        .split_once('i')
+        .ok_or_else(|| format!("Parent id {parent_id:?} is not <txid>i<index>"))?;
+    let txid: bitcoin::Txid = txid_hex
+        .parse()
+        .map_err(|e| format!("Invalid parent txid: {e}"))?;
+    let index: u32 = index.parse().map_err(|_| format!("Invalid parent index in {parent_id:?}"))?;
+    // Txid's byte order is already the internal (little-endian) one.
+    let mut value = bitcoin::hashes::Hash::to_byte_array(txid).to_vec();
+    let mut index_bytes = index.to_le_bytes().to_vec();
+    while index_bytes.last() == Some(&0) {
+        index_bytes.pop();
+    }
+    value.extend(index_bytes);
+    Ok(value)
+}
+
 /// Push a byte slice, handling the PushBytes length limit.
 fn push_bytes_checked(
     builder: ScriptBuilder,
@@ -178,17 +186,14 @@ fn push_bytes_checked(
 
 // ── Commit + Reveal builder ──────────────────────────────────────
 
-/// Parse the NUMS (nothing-up-my-sleeve) internal key.
-fn nums_internal_key() -> Result<UntweakedPublicKey, String> {
-    NUMS_POINT_HEX
-        .parse::<XOnlyPublicKey>()
-        .map(|k| UntweakedPublicKey::from(k))
-        .map_err(|e| format!("Bad NUMS point: {e}"))
-}
-
 /// Build a commit + reveal transaction pair for a single inscription.
 ///
-/// - `admin_pubkey`: the x-only key that will sign the reveal (Tapscript path).
+/// - `reveal_key`: a one-time x-only key, generated for this inscription only.
+///   It is the leaf's key (it signs the reveal's script path) and also the
+///   commit output's internal key, so whoever keeps its secret can recover the
+///   commit output by a key-path spend (`rawtr`), as `ord wallet inscribe` does.
+///   The user's own wallet then signs only key-path inputs, which every
+///   Taproot signer supports. The institution's admin stays in the JSON body.
 /// - `entity`: the BINST entity to inscribe.
 /// - `utxos`: available UTXOs to fund the commit.
 /// - `fee_rate_sat_vb`: fee rate in sat/vB.
@@ -203,7 +208,7 @@ fn nums_internal_key() -> Result<UntweakedPublicKey, String> {
 ///   tag 3 alone is not sufficient for the indexer to recognise the parent-child
 ///   link.
 pub fn build_commit_reveal(
-    admin_pubkey: &XOnlyPublicKey,
+    reveal_key: &XOnlyPublicKey,
     entity: &BinstEntity,
     utxos: &[Utxo],
     fee_rate_sat_vb: u64,
@@ -215,10 +220,10 @@ pub fn build_commit_reveal(
     let secp = Secp256k1::verification_only();
 
     // 1. Build inscription Tapscript.
-    let inscription_script = build_inscription_script(admin_pubkey, entity, parent_inscription_id)?;
+    let inscription_script = build_inscription_script(reveal_key, entity, parent_inscription_id)?;
 
-    // 2. Build Taproot tree with one leaf.
-    let internal_key = nums_internal_key()?;
+    // 2. Build Taproot tree with one leaf; the reveal key is the internal key too.
+    let internal_key = *reveal_key;
     let taproot = TaprootBuilder::new()
         .add_leaf(0, inscription_script.clone())
         .map_err(|e| format!("Taproot leaf error: {e:?}"))?
@@ -461,6 +466,20 @@ mod tests {
             website: None,
             vault: None,
         })
+    }
+
+    #[test]
+    fn parent_tag_encodes_txid_little_endian_and_trims_the_index() {
+        let txid = "0102030405060708091011121314151617181920212223242526272829303132";
+        let v0 = parent_tag_value(&format!("{txid}i0")).unwrap();
+        assert_eq!(v0.len(), 32);
+        assert_eq!(v0[0], 0x32);
+        assert_eq!(v0[31], 0x01);
+        let v1 = parent_tag_value(&format!("{txid}i1")).unwrap();
+        assert_eq!(&v1[32..], &[1]);
+        let v256 = parent_tag_value(&format!("{txid}i256")).unwrap();
+        assert_eq!(&v256[32..], &[0, 1]);
+        assert!(parent_tag_value(txid).is_err());
     }
 
     fn test_utxo(sats: u64) -> Utxo {

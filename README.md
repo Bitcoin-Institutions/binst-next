@@ -13,6 +13,8 @@ An institution is an Ordinals inscription on Bitcoin. Its process definitions ar
 | Institution trees from live data (UniSat indexer + Citrea RPC), with a featured institution that needs no wallet | Working |
 | Shareable URLs for every screen, including one instance | Working |
 | Create an institution, define a process, start an instance, execute a step | Built; not yet exercised with a wallet |
+| Sign elsewhere: a watch-only Taproot account whose PSBTs are signed by Sparrow, Bitcoin Core, Electrum or a hardware signer (file, copy/paste, animated BBQr/UR QR, camera scan back) | Institution and definition exercised on regtest with Bitcoin Core as the signer; not yet on testnet4 |
+| Your own servers: ord (`--index-addresses`), esplora/mempool and Citrea RPC, set under Settings | ord and esplora exercised on regtest |
 | Home page with a three.js view of the featured tree (static tree under reduced motion) | Working |
 | Members and roles on Nostr (NIP-58 badges issued by a key the holder vouches for with a BIP-322 signature) | Reading and verification working; binding and issuing not yet exercised with a wallet |
 | Bitcoin key authorising L2 steps, Ark treasury, covenant vault | Not built (see the Lab page) |
@@ -23,7 +25,7 @@ An institution is an Ordinals inscription on Bitcoin. Its process definitions ar
 |---|---|
 | The institution exists and who controls it | Bitcoin |
 | A process definition belongs to an institution | The indexer's rule that the child's reveal spent the parent's sat. Not a consensus rule. |
-| Finding institutions and definitions | The UniSat indexer API, a trusted third party |
+| Finding institutions and definitions | The UniSat indexer API, a trusted third party, or your own ord server (Settings) |
 | Instance state and step order | The Citrea contract |
 | Who may execute a step | Nobody yet: the pilot factory is open to anyone |
 | Members and roles | Signatures only: shown in the app, not enforced on L2 |

@@ -1,35 +1,36 @@
-// reused-from: binst-pilot-webapp@dda2d1a:src/inscribe.rs (2026-11-16) — adapted: wallet address read from the session store instead of hidden inputs; indexer module renamed
+// reused-from: binst-pilot-webapp@dda2d1a:src/inscribe.rs (2026-11-16) — adapted: wallet address read from the session store instead of hidden inputs; indexer module renamed; 2026-11-17 one-time reveal key signed in the page, wallet signs key-path inputs only (extension or hand-off), chain API from settings
 //! Serverless inscription flow — no local `ord` CLI, no bridge server.
 //!
 //! Full pipeline, entirely in-browser:
-//!   1. Fetch UTXOs for the connected address from Mempool.space
-//!   2. Build commit + reveal transactions via `txbuilder`
-//!   3. Sign commit PSBT via the connected BTC wallet (`signPsbt`)
-//!   4. Broadcast the signed commit tx via Mempool.space
-//!   5. Sign the reveal PSBT via the wallet
-//!   6. Broadcast the signed reveal tx
-//!   7. Return the reveal txid as the inscription reference
+//!   1. Fetch UTXOs for the connected address from the chain API (settings)
+//!   2. Make a one-time reveal key and save its recovery descriptor locally
+//!   3. Build commit + reveal transactions via `txbuilder`
+//!   4. The user's wallet signs the commit (key-path inputs only); the page
+//!      signs the reveal's script path with the one-time key and, for a child,
+//!      the wallet signs the parent input. Both are signed before either is
+//!      broadcast; the signed reveal is saved with the recovery key
+//!   5. Broadcast the commit, then the reveal
+//!   6. Return the reveal txid as the inscription reference
 //!
-//! Confirmation polling lives in `bridge::start_confirmation_poll`, which
-//! already queries Mempool.space directly (no local bridge needed).
+//! "The wallet" is either a browser extension (UniSat, Xverse) or any PSBT
+//! signer reached through the hand-off dialog (`handoff.rs`): Sparrow, Bitcoin
+//! Core, Electrum, or a hardware signer by file or QR.
 
 use bitcoin::base64::{engine::general_purpose::STANDARD, Engine};
 use bitcoin::psbt::Psbt;
+use bitcoin::secp256k1::SecretKey;
 use bitcoin::{Address, Amount, Network, OutPoint, Txid};
 use binst_inscription::BinstEntity;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::fetch::fetch_text;
-use crate::txbuilder::{build_commit_reveal, commit_to_psbt, psbt_to_base64, Utxo};
+use crate::reveal::{self, WalletKey};
+use crate::txbuilder::{build_commit_reveal, psbt_to_base64, Utxo};
 use crate::wallet::{
     detect_all_btc_providers, get_connected_l1_provider, get_connected_pubkey,
     is_sats_connect_provider, resolve_btc_provider,
 };
-
-// ── Network constants ─────────────────────────────────────────────
-
-const MEMPOOL_BASE: &str = "https://mempool.space/testnet4/api";
 
 // ── Public entry point ────────────────────────────────────────────
 
@@ -50,14 +51,9 @@ pub struct InscribeResult {
 ///
 /// - `entity`: the BINST entity to inscribe.
 /// - `fee_rate`: sat/vB (default 10 if 0 is passed).
-/// - `parent_inscription_id`: optional Ordinals parent ID (`<txid>i0`). When
-///   set, tag 3 is embedded in the envelope script, creating an on-chain
-///   cryptographic parent-child link (e.g. process template → institution).
+/// - `parent_inscription_id`: optional Ordinals parent ID (`<txid>i<n>`); tag 3.
 /// - `parent_utxo`: the UTXO currently holding the parent inscription's sat.
-///   **Required by the Ordinals provenance rule** — without spending the parent
-///   UTXO as an input of the reveal tx, the indexer ignores tag 3 entirely.
-///   Use `fetch_tx_output` to retrieve this from an already-broadcast (possibly
-///   unconfirmed) transaction.
+///   **Required by the Ordinals provenance rule** — the reveal must spend it.
 pub async fn inscribe_serverless(
     entity: &BinstEntity,
     fee_rate: u64,
@@ -73,7 +69,7 @@ pub async fn inscribe_serverless(
     if pubkey_hex.starts_with('<') {
         return Err("Connect a BTC wallet first".to_string());
     }
-    let admin_pubkey = pubkey_hex
+    let wallet_internal = pubkey_hex
         .parse::<bitcoin::key::XOnlyPublicKey>()
         .map_err(|e| format!("Invalid x-only pubkey: {e}"))?;
 
@@ -84,8 +80,13 @@ pub async fn inscribe_serverless(
         .map_err(|e| format!("Invalid wallet address '{address_str}': {e}"))?
         .require_network(network)
         .map_err(|_| format!("Address '{address_str}' is not testnet4"))?;
+    let wallet = WalletKey {
+        internal: wallet_internal,
+        origin: crate::session::l1_origin(),
+        script_pubkey: change_address.script_pubkey(),
+    };
 
-    // ── 2. Fetch UTXOs from Mempool.space ─────────────────────────
+    // ── 2. Fetch UTXOs ────────────────────────────────────────────
     let utxos = fetch_utxos(&address_str, &change_address).await?;
     if utxos.is_empty() {
         return Err(format!(
@@ -93,11 +94,8 @@ pub async fn inscribe_serverless(
         ));
     }
 
-    // Filter out inscription-carrier UTXOs (≤ 546 sats dust) from the funding
-    // pool used for coin selection.  Inscription sats must never be spent as
-    // commit inputs — doing so causes the wallet to warn "inscriptions will be
-    // spent" and risks destroying those inscriptions if change routing is wrong.
-    // The parent UTXO is passed separately and explicitly; it is never in this list.
+    // Inscription carriers (≤ 546 sats) are never spent as commit inputs; the
+    // parent UTXO is passed separately and explicitly.
     let funding_utxos: Vec<_> = utxos
         .into_iter()
         .filter(|u| u.amount.to_sat() > 546)
@@ -109,9 +107,13 @@ pub async fn inscribe_serverless(
         ));
     }
 
-    // ── 3. Build commit + reveal transactions ─────────────────────
+    // ── 3. One-time reveal key, then the plan ─────────────────────
+    let reveal_secret = fresh_secret()?;
+    let reveal_key = reveal_secret
+        .x_only_public_key(&bitcoin::secp256k1::Secp256k1::new())
+        .0;
     let plan = build_commit_reveal(
-        &admin_pubkey,
+        &reveal_key,
         entity,
         &funding_utxos,
         fee_rate,
@@ -120,68 +122,78 @@ pub async fn inscribe_serverless(
         parent_inscription_id,
         parent_utxo,
     )?;
-
     let estimated_fees = plan.estimated_fee;
+    let commit_txid_planned = plan.commit_tx.compute_txid().to_string();
+    let label = entity_label(entity);
+    // Saved before anything is signed: if the reveal never happens, this
+    // descriptor spends the commit output back (Bitcoin Core / Sparrow import).
+    // No copy, no signing.
+    let saved = crate::recovery::remember(crate::recovery::Record {
+        commit_txid: commit_txid_planned.clone(),
+        reveal_txid: String::new(),
+        reveal_hex: String::new(),
+        descriptor: reveal::recovery_descriptor(&plan, &reveal_secret),
+        label: label.clone(),
+        created_ms: js_sys::Date::now() as u64,
+    });
+    if !saved {
+        return Err("This browser would not save the one-time recovery key (private window or storage full), \
+                    so nothing was signed. Use a normal window and try again."
+            .into());
+    }
+    // An extension wallet never broadcasts what it signs here, so while
+    // nothing is broadcast a failed attempt can drop its record. A signer
+    // outside the browser (Sparrow, Core) may have broadcast the commit
+    // itself: its record is always kept.
+    let handoff = crate::session::l1_is_handoff();
+    let give_up = |why: String| {
+        if !handoff {
+            crate::recovery::forget(&commit_txid_planned);
+        }
+        why
+    };
 
-    // ── 4. Sign commit tx via wallet signPsbt ─────────────────────
-    let commit_psbt = commit_to_psbt(&plan)?;
-    let commit_psbt_b64 = psbt_to_base64(&commit_psbt);
+    // ── 4. Sign both transactions before broadcasting either ──────
+    // The commit's txid is fixed before signing (segwit), so the reveal can
+    // be signed now: a reload or a failed hand-off after this point leaves a
+    // complete reveal to rebroadcast, not a stranded commit.
+    let commit_psbt = reveal::commit_psbt(&plan, &wallet).map_err(give_up)?;
+    let signed_commit = sign_with_wallet(&commit_psbt, &address_str, "commit", &label).await.map_err(give_up)?;
+    let commit_hex = tx_hex(&reveal::extract(&signed_commit).map_err(give_up)?);
 
-    let signed_commit_b64 = wallet_sign_psbt(&commit_psbt_b64, &address_str).await?;
-    let commit_raw_hex = finalize_psbt_to_hex(&signed_commit_b64)?;
+    let mut reveal_psbt = reveal::reveal_psbt(&plan, &wallet).map_err(give_up)?;
+    reveal::sign_reveal_input(&mut reveal_psbt, &plan, &reveal_secret).map_err(give_up)?;
+    if !reveal::unsigned_inputs(&reveal_psbt).is_empty() {
+        reveal_psbt = sign_with_wallet(&reveal_psbt, &address_str, "reveal", &label).await.map_err(give_up)?;
+    }
+    let reveal_hex = tx_hex(&reveal::extract(&reveal_psbt).map_err(give_up)?);
+    crate::recovery::signed_reveal(&commit_txid_planned, &reveal_hex);
 
-    // ── 5. Broadcast commit tx ────────────────────────────────────
-    let commit_txid = broadcast_tx(&commit_raw_hex).await?;
+    // ── 5. Broadcast ──────────────────────────────────────────────
+    // A failed broadcast call does not prove the commit was not relayed, so
+    // the key is kept from here on.
+    let commit_txid = broadcast_tx(&commit_hex).await?;
     web_sys::console::log_1(&JsValue::from_str(&format!(
         "[BINST] Commit tx broadcast: {commit_txid}"
     )));
-
-    // ── 6. Build reveal PSBT (now we know the real commit txid) ───
-    // txbuilder already embedded the correct commit txid (computed from the
-    // unsigned tx). After signing, the txid doesn't change (witness data is
-    // segwit so it goes into wtxid, not txid). So the reveal's input is correct.
-    let reveal_psbt = build_reveal_psbt(&plan)?;
-    let reveal_psbt_b64 = psbt_to_base64(&reveal_psbt);
-
-    let signed_reveal_b64 = wallet_sign_psbt(&reveal_psbt_b64, &address_str).await?;
-    let reveal_raw_hex = finalize_psbt_to_hex(&signed_reveal_b64)?;
-
-    // ── 7. Broadcast reveal tx ────────────────────────────────────
-    let reveal_txid = broadcast_tx(&reveal_raw_hex).await?;
+    let reveal_txid = broadcast_tx(&reveal_hex).await.map_err(|why| {
+        format!("{why}. The commit is out; the signed reveal is saved under Settings to broadcast again.")
+    })?;
     web_sys::console::log_1(&JsValue::from_str(&format!(
         "[BINST] Reveal tx broadcast: {reveal_txid}"
     )));
+    crate::recovery::revealed(&commit_txid_planned, &reveal_txid);
 
     let inscription_id = format!("{reveal_txid}i0");
-
-    // The inscription sat lives at `plan.inscription_vout()` of the reveal tx
-    // (output 1 when a parent was spent, since the parent is returned in output 0).
-    // Build the UTXO descriptor so callers can pass it as `parent_utxo`
-    // to the next child inscription without waiting for confirmation.
-    //
-    // reveal_txid comes from mempool.space (already trimmed) and should
-    // always be a valid 64-hex txid.  If somehow it's not, we still
-    // return Ok — the reveal already broadcast successfully.  The caller
-    // (stack_ui) derives reveal_utxo from `fetch_tx_output` as a fallback.
     let inscription_vout = plan.inscription_vout();
     let inscription_out = &plan.reveal_tx.output[inscription_vout as usize];
-    let reveal_utxo = if let Ok(txid_parsed) = reveal_txid.parse::<Txid>() {
-        Utxo {
-            outpoint: OutPoint::new(txid_parsed, inscription_vout),
-            amount: inscription_out.value,
-            script_pubkey: inscription_out.script_pubkey.clone(),
-        }
-    } else {
-        web_sys::console::warn_1(&JsValue::from_str(&format!(
-            "[BINST] Could not parse reveal txid '{}' as Txid — reveal_utxo will be a placeholder",
-            reveal_txid
-        )));
-        // Placeholder — callers that need the real UTXO should use fetch_tx_output.
-        Utxo {
-            outpoint: OutPoint::null(),
-            amount: inscription_out.value,
-            script_pubkey: inscription_out.script_pubkey.clone(),
-        }
+    let reveal_utxo = Utxo {
+        outpoint: OutPoint::new(
+            reveal_txid.parse::<Txid>().unwrap_or_else(|_| plan.reveal_tx.compute_txid()),
+            inscription_vout,
+        ),
+        amount: inscription_out.value,
+        script_pubkey: inscription_out.script_pubkey.clone(),
     };
 
     Ok(InscribeResult {
@@ -193,12 +205,63 @@ pub async fn inscribe_serverless(
     })
 }
 
+fn entity_label(entity: &BinstEntity) -> String {
+    match entity {
+        BinstEntity::Institution(b) => format!("Institution \"{}\"", b.name),
+        BinstEntity::ProcessTemplate(b) => format!("Process \"{}\"", b.name),
+        _ => "Inscription".to_string(),
+    }
+}
+
+fn tx_hex(tx: &bitcoin::Transaction) -> String {
+    hex_encode(&bitcoin::consensus::encode::serialize(tx))
+}
+
+/// 32 random bytes from Web Crypto as a secret key.
+fn fresh_secret() -> Result<SecretKey, String> {
+    let crypto = web_sys::window()
+        .and_then(|w| w.crypto().ok())
+        .ok_or("This browser has no Web Crypto")?;
+    for _ in 0..4 {
+        let mut bytes = [0u8; 32];
+        crypto
+            .get_random_values_with_u8_array(&mut bytes)
+            .map_err(|e| format!("crypto.getRandomValues: {e:?}"))?;
+        if let Ok(secret) = SecretKey::from_slice(&bytes) {
+            return Ok(secret);
+        }
+    }
+    Err("Could not make a reveal key".into())
+}
+
+/// Have the user's wallet sign its key-path inputs, and return the merged,
+/// checked PSBT. Extension wallets are called directly; any other signer goes
+/// through the hand-off dialog (file, QR, copy/paste, Bitcoin Core command).
+async fn sign_with_wallet(psbt: &Psbt, address: &str, step: &str, label: &str) -> Result<Psbt, String> {
+    let returned: Vec<u8> = if crate::session::l1_is_handoff() {
+        crate::handoff::request(step, label, psbt).await?
+    } else {
+        wallet_sign_psbt(&psbt_to_base64(psbt), address).await?.into_bytes()
+    };
+    let mut merged = reveal::merge_signed(psbt, &returned)?;
+    reveal::finalize_key_path_inputs(&mut merged);
+    let missing = reveal::unsigned_inputs(&merged);
+    if !missing.is_empty() {
+        return Err(format!(
+            "The {step} came back without a signature on input(s) {missing:?}. \
+             Check that the signer holds the key for {address}."
+        ));
+    }
+    reveal::verify_key_path_signatures(&merged)?;
+    Ok(merged)
+}
+
 // ── UTXO fetching ─────────────────────────────────────────────────
 
 async fn fetch_utxos(address: &str, script_address: &Address) -> Result<Vec<Utxo>, String> {
-    let url = format!("{MEMPOOL_BASE}/address/{address}/utxo");
+    let url = format!("{}/address/{address}/utxo", crate::settings::esplora_base());
     let text = fetch_text(&url).await.map_err(|e| {
-        format!("Failed to fetch UTXOs from Mempool.space: {e}")
+        format!("Failed to fetch UTXOs from the chain API: {e}")
     })?;
 
     let items: serde_json::Value = serde_json::from_str(&text)
@@ -233,19 +296,14 @@ async fn fetch_utxos(address: &str, script_address: &Address) -> Result<Vec<Utxo
     Ok(utxos)
 }
 
-// ── Wallet PSBT signing ───────────────────────────────────────────
+// ── Extension wallet PSBT signing ─────────────────────────────────
 
-/// Sign a PSBT via the connected BTC wallet.
+/// Sign a PSBT via the connected browser-extension wallet.
 ///
 /// Two paths:
 ///  1. **Sats-connect** (Xverse): `provider.request("signPsbt", { psbt, signInputs, broadcast: false })`
-///     → response `{ result: { psbt: "<base64>" } }` or `{ status: "success", result: { psbt } }`
 ///  2. **Direct** (UniSat, OKX): `provider.signPsbt(psbtHex, options)` → hex string.
-///
-/// `signing_address` is used in both paths so the wallet knows which key to
-/// use for each input.
 async fn wallet_sign_psbt(psbt_b64: &str, signing_address: &str) -> Result<String, String> {
-    // Resolve the connected provider
     let stored_path = get_connected_l1_provider();
     let (provider, window_path) = if !stored_path.is_empty() {
         let p = resolve_btc_provider(&stored_path)
@@ -261,12 +319,9 @@ async fn wallet_sign_psbt(psbt_b64: &str, signing_address: &str) -> Result<Strin
         (p, handle.window_path.to_string())
     };
 
-    // Detect sats-connect (Xverse): has request + connect, no requestAccounts
     if is_sats_connect_provider(&provider) {
         return wallet_sign_psbt_sats_connect(&provider, psbt_b64, signing_address, &window_path).await;
     }
-
-    // Direct path: signPsbt() / signPSBT()
     wallet_sign_psbt_direct(&provider, psbt_b64, signing_address, &window_path).await
 }
 
@@ -308,6 +363,10 @@ async fn wallet_sign_psbt_sats_connect(
         std::collections::HashMap::new();
 
     for (i, inp) in psbt.inputs.iter().enumerate() {
+        // The reveal's script-path input arrives already signed by the page.
+        if inp.final_script_witness.is_some() {
+            continue;
+        }
         let addr = inp.witness_utxo.as_ref().and_then(|txout| {
             Address::from_script(&txout.script_pubkey, network)
                 .ok()
@@ -409,12 +468,11 @@ fn require_parent_utxo(parent_inscription_id: Option<&str>, parent_utxo: Option<
     }
 }
 
-/// Which PSBT inputs to ask a direct-API wallet to sign: the Tapscript input
-/// (the inscription commit — input 1 in a child reveal, input 0 otherwise) and
-/// any input whose UTXO belongs to `signing_address` (commit funding UTXOs, the
-/// parent sat). Anything else is skipped.
-fn should_sign_input(is_tapscript: bool, utxo_addr: Option<&str>, signing_address: &str) -> bool {
-    is_tapscript || utxo_addr == Some(signing_address)
+/// Which PSBT inputs to ask a direct-API wallet to sign: inputs not signed yet
+/// whose UTXO belongs to `signing_address` (commit funding UTXOs, the parent
+/// sat). The reveal's script-path input is already signed by the page.
+fn should_sign_input(already_signed: bool, utxo_addr: Option<&str>, signing_address: &str) -> bool {
+    !already_signed && utxo_addr == Some(signing_address)
 }
 
 /// Direct `signPsbt(psbtHex, options)` call — used by UniSat, OKX, etc.
@@ -424,17 +482,10 @@ fn should_sign_input(is_tapscript: bool, utxo_addr: Option<&str>, signing_addres
 /// - UniSat returns **hex** (not base64 or `{ psbt }`).
 /// - For multi-input PSBTs, `toSignInputs` must be provided explicitly so
 ///   UniSat knows which key to use for each input.
-/// - The commit input of the reveal PSBT (input 0 for a root, input 1 for a
-///   child) is a Tapscript (script-path) spend.
-///   `disableTweakSigner: true` is required — it tells UniSat to sign with
-///   the raw (untweaked) private key, which is what Tapscript CHECKSIG needs.
-/// - The parent UTXO (input 0 of a child reveal) is a P2TR key-path spend.
-///   We include it only when it is owned by `signing_address` (i.e. the sat
-///   has been transferred to the wallet's ordinals address).  If it lives at
-///   a NUMS-tweaked inscription address, UniSat cannot sign it key-path and
-///   we skip it (the input remains unsigned; the broadcast will fail — but
-///   that is a separate problem from the PSBT params rejection we are fixing
-///   here).
+/// - The page signs the reveal's script-path input itself (one-time reveal
+///   key), so the wallet is asked only for key-path inputs at its own address:
+///   commit funding inputs and the parent sat. `disableTweakSigner` is never
+///   set; key-path inputs need the tweaked key.
 async fn wallet_sign_psbt_direct(
     provider: &JsValue,
     psbt_b64: &str,
@@ -464,45 +515,19 @@ async fn wallet_sign_psbt_direct(
     let psbt = Psbt::deserialize(&psbt_bytes)
         .map_err(|e| format!("PSBT deserialize: {e}"))?;
 
-    // Build toSignInputs: one entry per input that we want UniSat to sign.
-    //
-    // disableTweakSigner controls which signing key UniSat uses:
-    //   false (default): tweaked key  — correct for plain P2TR key-path spends
-    //                                   (commit UTXO at wallet address, parent sat at wallet address)
-    //   true:            raw key      — correct for Tapscript CHECKSIG leaf spends
-    //                                   (reveal input 0, which has tap_scripts in the PSBT)
-    //
-    // Detecting Tapscript inputs: the PSBT input has a non-empty tap_scripts map.
-    // Plain key-path P2TR inputs have no tap_scripts.
+    // toSignInputs: the unsigned inputs whose UTXO is at the wallet's address.
     let network = Network::Testnet4;
     let to_sign_inputs = js_sys::Array::new();
-
     for (i, inp) in psbt.inputs.iter().enumerate() {
         let utxo_addr = inp.witness_utxo.as_ref().and_then(|txout| {
-            Address::from_script(&txout.script_pubkey, network)
-                .ok()
-                .map(|a| a.to_string())
+            Address::from_script(&txout.script_pubkey, network).ok().map(|a| a.to_string())
         });
-
-        let should_sign = should_sign_input(!inp.tap_scripts.is_empty(), utxo_addr.as_deref(), signing_address);
-
-        if !should_sign {
-            web_sys::console::warn_1(&JsValue::from_str(&format!(
-                "[BINST] signPsbt: skipping input {i} (UTXO addr {:?} ≠ wallet addr {})",
-                utxo_addr, &signing_address[..signing_address.len().min(20)]
-            )));
+        if !should_sign_input(inp.final_script_witness.is_some(), utxo_addr.as_deref(), signing_address) {
             continue;
         }
-
-        // Use disableTweakSigner only for Tapscript-path inputs (those that have
-        // tap_scripts populated).  Plain key-path P2TR inputs (commit UTXO, parent sat)
-        // must be signed with the tweaked key — disableTweakSigner would break them.
-        let is_tapscript = !inp.tap_scripts.is_empty();
-
         let entry = js_sys::Object::new();
         js_sys::Reflect::set(&entry, &JsValue::from_str("index"), &JsValue::from_f64(i as f64)).ok();
         js_sys::Reflect::set(&entry, &JsValue::from_str("address"), &JsValue::from_str(signing_address)).ok();
-        js_sys::Reflect::set(&entry, &JsValue::from_str("disableTweakSigner"), &JsValue::from_bool(is_tapscript)).ok();
         to_sign_inputs.push(&entry);
     }
 
@@ -553,181 +578,6 @@ fn is_rejection(msg: &str) -> bool {
     lower.contains("reject") || lower.contains("cancel") || lower.contains("denied")
 }
 
-// ── PSBT finalization ─────────────────────────────────────────────
-
-/// Finalize a signed PSBT and extract the raw hex transaction.
-///
-/// Wallets return the signed PSBT in different encodings:
-/// - UniSat returns hex (with autoFinalized: false → sigs in tap_key_sig /
-///   tap_script_sigs, NOT in final_script_witness)
-/// - Xverse / OKX return base64 (already finalized — final_script_witness set)
-///
-/// We try hex first (pure [0-9a-fA-F] chars), then fall back to base64.
-/// After decoding we call `finalize_psbt_inputs` to move tap signatures into
-/// `final_script_witness` before calling `extract_tx`.
-fn finalize_psbt_to_hex(signed_psbt: &str) -> Result<String, String> {
-    let s = signed_psbt.trim();
-
-    // Detect hex: all chars are hex digits and length is even
-    let psbt_bytes = if s.len() % 2 == 0 && s.chars().all(|c| c.is_ascii_hexdigit()) {
-        hex_decode(s).map_err(|e| format!("PSBT hex decode failed: {e}"))?
-    } else {
-        STANDARD
-            .decode(s)
-            .map_err(|e| format!("PSBT base64 decode failed: {e}"))?
-    };
-
-    let mut psbt = Psbt::deserialize(&psbt_bytes)
-        .map_err(|e| format!("Failed to deserialize signed PSBT: {e}"))?;
-
-    // Move tap signatures into final_script_witness for any inputs that are
-    // not yet finalized (UniSat with autoFinalized:false leaves sigs in
-    // tap_key_sig / tap_script_sigs rather than final_script_witness).
-    finalize_psbt_inputs(&mut psbt)?;
-
-    let tx = psbt
-        .extract_tx()
-        .map_err(|e| format!("PSBT not fully signed — cannot extract tx: {e}"))?;
-
-    let raw = bitcoin::consensus::encode::serialize(&tx);
-    Ok(hex_encode(&raw))
-}
-
-/// Finalize PSBT inputs that carry Taproot signatures but have not yet had
-/// their `final_script_witness` set.
-///
-/// Two cases handled:
-///
-/// 1. **Key-path P2TR** (`tap_scripts` empty, `tap_key_sig` set):
-///    `witness = [<64-byte schnorr sig>]`
-///
-/// 2. **Script-path / Tapscript** (`tap_scripts` non-empty, `tap_script_sigs` set):
-///    `witness = [<sig>, <script>, <control_block>]`
-///    (BIP-341 script-path witness stack, bottom-to-top order)
-///
-/// Inputs that already have `final_script_witness` set are left untouched
-/// (Xverse sets it; we don't want to overwrite a valid finalization).
-fn finalize_psbt_inputs(psbt: &mut Psbt) -> Result<(), String> {
-    use bitcoin::Witness;
-
-    for (i, inp) in psbt.inputs.iter_mut().enumerate() {
-        // Already finalized — nothing to do.
-        if inp.final_script_witness.is_some() {
-            continue;
-        }
-
-        if inp.tap_scripts.is_empty() {
-            // ── Key-path spend ────────────────────────────────────
-            // tap_key_sig should hold a 64-byte Schnorr signature.
-            if let Some(sig) = inp.tap_key_sig {
-                let mut w = Witness::new();
-                w.push(sig.to_vec());
-                inp.final_script_witness = Some(w);
-                web_sys::console::log_1(&JsValue::from_str(&format!(
-                    "[BINST] finalize input {i}: key-path sig → final_script_witness"
-                )));
-            } else {
-                web_sys::console::warn_1(&JsValue::from_str(&format!(
-                    "[BINST] finalize input {i}: no tap_key_sig and no final_script_witness — witness will be empty"
-                )));
-            }
-        } else {
-            // ── Script-path / Tapscript spend ─────────────────────
-            // Find the first tap_script_sigs entry that matches a known leaf.
-            // For our inscriptions there is always exactly one leaf.
-            let maybe_sig = inp
-                .tap_script_sigs
-                .values()
-                .next()
-                .copied();
-
-            let maybe_leaf = inp.tap_scripts.iter().next();
-
-            match (maybe_sig, maybe_leaf) {
-                (Some(sig), Some((cb, (script, _)))) => {
-                    // BIP-341 script-path witness: <sig> <script> <control_block>
-                    let mut w = Witness::new();
-                    w.push(sig.to_vec());
-                    w.push(script.as_bytes());
-                    w.push(cb.serialize());
-                    inp.final_script_witness = Some(w);
-                    web_sys::console::log_1(&JsValue::from_str(&format!(
-                        "[BINST] finalize input {i}: tapscript sig → final_script_witness ({} script bytes)",
-                        script.len()
-                    )));
-                }
-                _ => {
-                    web_sys::console::warn_1(&JsValue::from_str(&format!(
-                        "[BINST] finalize input {i}: tap_scripts present but no tap_script_sigs — witness will be empty"
-                    )));
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Build a PSBT for the reveal transaction.
-fn build_reveal_psbt(plan: &crate::txbuilder::InscriptionPlan) -> Result<Psbt, String> {
-    // The reveal tx has a script-path Taproot input. We embed the PSBT
-    // input metadata (witness UTXO, tap leaf script, control block) so
-    // the wallet knows exactly what to sign.
-    use bitcoin::psbt::{Input as PsbtInput};
-    use bitcoin::taproot::LeafVersion;
-
-    let mut psbt = Psbt::from_unsigned_tx(plan.reveal_tx.clone())
-        .map_err(|e| format!("Reveal PSBT creation failed: {e}"))?;
-
-    // Commit input (Tapscript path — carries the inscription). It is input 0
-    // for a root and input 1 when a parent is spent (see txbuilder step 7).
-    let commit_idx = plan.commit_input_index();
-    let commit_out = plan.commit_tx.output[0].clone();
-
-    let control_block = plan
-        .taproot_spend_info
-        .control_block(&(plan.inscription_script.clone(), LeafVersion::TapScript))
-        .ok_or("Cannot compute control block for reveal")?;
-
-    let mut commit_input = PsbtInput::default();
-    commit_input.witness_utxo = Some(commit_out);
-    commit_input.tap_scripts.insert(
-        control_block.clone(),
-        (plan.inscription_script.clone(), LeafVersion::TapScript),
-    );
-    // tap_leaf_hash for the script-path — wallets use this to know which leaf to sign
-    let leaf_hash = bitcoin::taproot::TapLeafHash::from_script(
-        &plan.inscription_script,
-        LeafVersion::TapScript,
-    );
-    commit_input.tap_key_origins.insert(
-        // Use an all-zero key as placeholder; wallet reads the script from tap_scripts
-        plan.taproot_spend_info.output_key().to_x_only_public_key(),
-        (vec![leaf_hash], (bitcoin::bip32::Fingerprint::default(), bitcoin::bip32::DerivationPath::default())),
-    );
-    psbt.inputs[commit_idx] = commit_input;
-
-    // Parent UTXO (optional, input 0 when present): key-path P2TR spend.
-    // We provide `witness_utxo` so the wallet knows the value and script.
-    // The wallet signs this with the key-path (no tap_scripts needed).
-    if let Some(ref p_utxo) = plan.parent_utxo {
-        let mut parent_input = PsbtInput::default();
-        parent_input.witness_utxo = Some(bitcoin::TxOut {
-            value: p_utxo.amount,
-            script_pubkey: p_utxo.script_pubkey.clone(),
-        });
-        let parent_idx = plan
-            .reveal_tx
-            .input
-            .iter()
-            .position(|i| i.previous_output == p_utxo.outpoint)
-            .ok_or("Reveal tx does not spend the parent UTXO")?;
-        psbt.inputs[parent_idx] = parent_input;
-    }
-
-    Ok(psbt)
-}
-
 // ── Parent UTXO fetching ──────────────────────────────────────────
 
 /// Fetch a specific output from a (possibly unconfirmed) transaction via
@@ -740,7 +590,7 @@ fn build_reveal_psbt(plan: &crate::txbuilder::InscriptionPlan) -> Result<Psbt, S
 /// `vout` is `0` for a root inscription and `1` for a child (the parent is
 /// returned in output 0 of a child reveal).
 pub async fn fetch_tx_output(txid: &str, vout: u32) -> Result<Utxo, String> {
-    let url = format!("{MEMPOOL_BASE}/tx/{txid}");
+    let url = format!("{}/tx/{txid}", crate::settings::esplora_base());
     let text = fetch_text(&url)
         .await
         .map_err(|e| format!("Failed to fetch tx {txid}: {e}"))?;
@@ -820,10 +670,10 @@ pub async fn fetch_inscription_sat_utxo(inscription_id: &str) -> Result<Utxo, St
     fetch_tx_output(&txid, vout).await
 }
 
-/// Broadcast a raw transaction hex to Mempool.space testnet4.
+/// Broadcast a raw transaction hex through the chain API (mempool.space by default).
 /// Returns the txid on success.
 async fn broadcast_tx(raw_hex: &str) -> Result<String, String> {
-    let url = format!("{MEMPOOL_BASE}/tx");
+    let url = format!("{}/tx", crate::settings::esplora_base());
 
     let opts = web_sys::RequestInit::new();
     opts.set_method("POST");
@@ -891,100 +741,29 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::key::{TweakedPublicKey, XOnlyPublicKey};
-    use binst_inscription::InstitutionBody;
-    use std::str::FromStr;
-
-    const ADMIN: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-
-    fn wallet_address() -> Address {
-        let pk = XOnlyPublicKey::from_str(ADMIN).unwrap();
-        Address::p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(pk), Network::Testnet4)
-    }
-
-    fn plan(with_parent: bool) -> crate::txbuilder::InscriptionPlan {
-        let pk = XOnlyPublicKey::from_str(ADMIN).unwrap();
-        let addr = wallet_address();
-        let entity = BinstEntity::Institution(InstitutionBody {
-            v: 0,
-            name: "TestInst".into(),
-            admin: ADMIN.into(),
-            citrea_contract: None,
-            membership_rune: None,
-            description: None,
-            website: None,
-            vault: None,
-        });
-        let funding = Utxo {
-            outpoint: OutPoint::new(
-                Txid::from_str("1111111111111111111111111111111111111111111111111111111111111111").unwrap(),
-                0,
-            ),
-            amount: Amount::from_sat(200_000),
-            script_pubkey: addr.script_pubkey(),
-        };
-        let parent = Utxo {
-            outpoint: OutPoint::new(
-                Txid::from_str("2222222222222222222222222222222222222222222222222222222222222222").unwrap(),
-                0,
-            ),
-            amount: Amount::from_sat(546),
-            script_pubkey: addr.script_pubkey(),
-        };
-        let parent_id = "2222222222222222222222222222222222222222222222222222222222222222i0";
-        build_commit_reveal(
-            &pk,
-            &entity,
-            &[funding],
-            2,
-            &addr,
-            Network::Testnet4,
-            with_parent.then_some(parent_id),
-            with_parent.then_some(parent),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn child_reveal_psbt_puts_tapscript_on_input_1_and_parent_on_input_0() {
-        let p = plan(true);
-        let psbt = build_reveal_psbt(&p).unwrap();
-        assert_eq!(psbt.inputs.len(), 2);
-        assert!(psbt.inputs[0].tap_scripts.is_empty(), "parent input is a key-path spend");
-        assert_eq!(
-            psbt.inputs[0].witness_utxo.as_ref().map(|o| o.value),
-            Some(p.parent_utxo.as_ref().unwrap().amount),
-        );
-        assert!(!psbt.inputs[1].tap_scripts.is_empty(), "commit input carries the inscription leaf");
-        assert_eq!(psbt.inputs[1].witness_utxo.as_ref(), Some(&p.commit_tx.output[0]));
-    }
-
-    #[test]
-    fn root_reveal_psbt_keeps_tapscript_on_input_0() {
-        let p = plan(false);
-        let psbt = build_reveal_psbt(&p).unwrap();
-        assert_eq!(psbt.inputs.len(), 1);
-        assert!(!psbt.inputs[0].tap_scripts.is_empty());
-    }
 
     #[test]
     fn parent_id_without_parent_utxo_is_refused() {
         let pid = "2222222222222222222222222222222222222222222222222222222222222222i0";
         assert!(require_parent_utxo(Some(pid), None).is_err());
         assert!(require_parent_utxo(None, None).is_ok());
-        let p = plan(true);
-        assert!(require_parent_utxo(Some(pid), p.parent_utxo.as_ref()).is_ok());
+        let parent = Utxo {
+            outpoint: OutPoint::null(),
+            amount: Amount::from_sat(546),
+            script_pubkey: bitcoin::ScriptBuf::new(),
+        };
+        assert!(require_parent_utxo(Some(pid), Some(&parent)).is_ok());
     }
 
     #[test]
-    fn direct_signer_signs_commit_at_any_index_and_only_own_key_path_inputs() {
-        let me = wallet_address().to_string();
-        // Commit (Tapscript) input lives at the NUMS commit address, not ours: still signed.
-        assert!(should_sign_input(true, Some("tb1pcommitaddress"), &me));
-        // Parent / funding input at our address: signed.
-        assert!(should_sign_input(false, Some(me.as_str()), &me));
-        // Foreign key-path input: skipped.
-        assert!(!should_sign_input(false, Some("tb1psomeoneelse"), &me));
-        assert!(!should_sign_input(false, None, &me));
+    fn direct_signer_signs_only_own_unsigned_inputs() {
+        let me = "tb1pme";
+        assert!(should_sign_input(false, Some(me), me));
+        // The reveal's script-path input, already signed by the page: skipped.
+        assert!(!should_sign_input(true, Some("tb1pcommitaddress"), me));
+        assert!(!should_sign_input(true, Some(me), me));
+        // Foreign input: skipped.
+        assert!(!should_sign_input(false, Some("tb1psomeoneelse"), me));
+        assert!(!should_sign_input(false, None, me));
     }
 }

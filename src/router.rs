@@ -15,6 +15,8 @@ pub enum Route {
     Instance { address: String },
     /// The create-institution flow.
     New,
+    /// Where chain data comes from, and the one-time reveal keys.
+    Settings,
     /// The Lab index, or one frontier feature.
     Lab(Option<String>),
     NotFound(String),
@@ -30,6 +32,7 @@ pub fn parse(hash: &str) -> Route {
         [""] => Route::Home,
         ["institutions"] => Route::Institutions,
         ["new"] => Route::New,
+        ["settings"] => Route::Settings,
         ["lab"] => Route::Lab(None),
         ["lab", page] if LAB_PAGES.contains(page) => Route::Lab(Some((*page).to_string())),
         ["i", id] if is_inscription_id(id) => Route::Institution { id: (*id).to_string(), definition: None },
@@ -48,6 +51,7 @@ pub fn href(route: &Route) -> String {
         Route::Home => "#/".to_string(),
         Route::Institutions => "#/institutions".to_string(),
         Route::New => "#/new".to_string(),
+        Route::Settings => "#/settings".to_string(),
         Route::Lab(None) => "#/lab".to_string(),
         Route::Lab(Some(page)) => format!("#/lab/{page}"),
         Route::Institution { id, definition: None } => format!("#/i/{id}"),

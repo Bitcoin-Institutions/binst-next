@@ -1,4 +1,4 @@
-// reused-from: binst-pilot-webapp@dda2d1a:src/search.rs (2026-11-16) — adapted: indexer half only (configuration, UniSat parsing, fetches) plus its tests; the search view is not carried over
+// reused-from: binst-pilot-webapp@dda2d1a:src/search.rs (2026-11-16) — adapted: 2026-11-17 the user's own ord server (settings) as a backend; indexer half only (configuration, UniSat parsing, fetches) plus its tests; the search view is not carried over
 use wasm_bindgen::JsCast;
 
 // ── Indexer configuration ────────────────────────────────────────
@@ -119,8 +119,69 @@ async fn fetch_indexer_json(url: &str) -> Result<serde_json::Value, String> {
     serde_json::from_str(&text).map_err(|e| format!("indexer JSON: {e}"))
 }
 
+// ── The user's own ord server ────────────────────────────────────
+
+/// Parse ord's `GET /inscription/<id>` JSON.
+pub(crate) fn parse_ord_inscription(v: &serde_json::Value) -> Result<IndexedInscription, String> {
+    let id = v.get("id").and_then(|i| i.as_str()).ok_or("ord returned no inscription id")?.to_string();
+    let address = v.get("address").and_then(|a| a.as_str()).unwrap_or("").to_string();
+    // satpoint is "<txid>:<vout>:<offset>".
+    let output = v.get("satpoint").and_then(|s| s.as_str()).and_then(|sp| {
+        let mut parts = sp.split(':');
+        let txid = parts.next()?;
+        let vout = parts.next()?.parse().ok()?;
+        (txid.len() == 64).then(|| (txid.to_string(), vout))
+    });
+    // ord lists only parents whose sat was spent in the reveal.
+    let parents = v
+        .get("parents")
+        .and_then(|p| p.as_array())
+        .map(|arr| arr.iter().filter_map(|p| p.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let height = v.get("height").and_then(|h| h.as_u64()).filter(|h| *h > 0);
+    Ok(IndexedInscription { id, address, output, parents, height })
+}
+
+/// Parse ord's `GET /address/<address>` JSON (needs `--index-addresses`).
+pub(crate) fn parse_ord_address(v: &serde_json::Value) -> Vec<String> {
+    v.get("inscriptions")
+        .and_then(|i| i.as_array())
+        .map(|arr| arr.iter().filter_map(|i| i.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+/// GET JSON from the user's ord server (ord answers JSON to this Accept header).
+async fn fetch_ord_json(url: &str) -> Result<serde_json::Value, String> {
+    let opts = web_sys::RequestInit::new();
+    opts.set_method("GET");
+    let req = web_sys::Request::new_with_str_and_init(url, &opts).map_err(|e| format!("ord request: {e:?}"))?;
+    req.headers().set("Accept", "application/json").ok();
+    let window = web_sys::window().ok_or("no window")?;
+    let resp: web_sys::Response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_request(&req))
+        .await
+        .map_err(|_| format!("Your ord server did not answer ({url}). Is it running, and reachable from this page?"))?
+        .unchecked_into();
+    let text = wasm_bindgen_futures::JsFuture::from(resp.text().map_err(|_| "text()")?)
+        .await
+        .map_err(|e| format!("ord text: {e:?}"))?
+        .as_string()
+        .unwrap_or_default();
+    if !resp.ok() {
+        let hint = if resp.status() == 404 && url.contains("/address/") {
+            " (run ord with --index-addresses)"
+        } else {
+            ""
+        };
+        return Err(format!("ord HTTP {}{hint}: {}", resp.status(), text.chars().take(120).collect::<String>()));
+    }
+    serde_json::from_str(&text).map_err(|e| format!("ord JSON: {e}"))
+}
+
 /// Look up one inscription: holder, current sat output and validated parents.
 pub(crate) async fn indexer_inscription(id: &str) -> Result<IndexedInscription, String> {
+    if let Some(ord) = crate::settings::ord_base() {
+        return parse_ord_inscription(&fetch_ord_json(&format!("{ord}/inscription/{id}")).await?);
+    }
     let IndexerBackend::UniSat { base_url } = &INDEXER else {
         return Err("inscription lookup needs the UniSat backend".into());
     };
@@ -133,6 +194,14 @@ pub(crate) async fn indexer_inscription(id: &str) -> Result<IndexedInscription, 
 pub(crate) async fn indexer_address_inscriptions(
     address: &str,
 ) -> Result<Vec<IndexedInscription>, String> {
+    if let Some(ord) = crate::settings::ord_base() {
+        let ids = parse_ord_address(&fetch_ord_json(&format!("{ord}/address/{address}")).await?);
+        let mut all = Vec::new();
+        for id in ids.iter().take((INDEXER_PAGE_SIZE * INDEXER_MAX_PAGES) as usize) {
+            all.push(parse_ord_inscription(&fetch_ord_json(&format!("{ord}/inscription/{id}")).await?)?);
+        }
+        return Ok(all);
+    }
     let IndexerBackend::UniSat { base_url } = &INDEXER else {
         return Err("address listing needs the UniSat backend".into());
     };
@@ -154,6 +223,9 @@ pub(crate) async fn indexer_address_inscriptions(
 
 /// URL of an inscription's raw content.
 pub(crate) fn indexer_content_url(id: &str) -> String {
+    if let Some(ord) = crate::settings::ord_base() {
+        return format!("{ord}/content/{id}");
+    }
     match &INDEXER {
         IndexerBackend::UniSat { base_url } => {
             format!("{base_url}/v1/indexer/inscription/content/{id}")
@@ -241,6 +313,25 @@ mod tests {
         assert_eq!(total, 11);
         assert_eq!(items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), vec![PARENT, CHILD]);
         assert_eq!(items[1].parents, vec![PARENT.to_string()]);
+    }
+
+    #[test]
+    fn ord_inscription_and_address_parse() {
+        // Shapes from ord 0.27.1 (regtest, --index-addresses).
+        let child = serde_json::json!({
+            "address": "bcrt1p9flm5zs8z2rnjplvly0mdtn3jqxuqentsqf7wfn2d8vzf3nea0lqsm64fj",
+            "height": 153, "id": CHILD, "metaprotocol": "binst",
+            "parents": [PARENT],
+            "satpoint": "5863206b9078f3b8c5509a20e3d58373eb6883bd199e9cfa514bb98a5ff0c8d3:1:0",
+            "value": 546
+        });
+        let ins = parse_ord_inscription(&child).unwrap();
+        assert_eq!(ins.parents, vec![PARENT.to_string()]);
+        assert_eq!(ins.output, Some(("5863206b9078f3b8c5509a20e3d58373eb6883bd199e9cfa514bb98a5ff0c8d3".to_string(), 1)));
+        assert_eq!(ins.height, Some(153));
+        let addr = serde_json::json!({ "outputs": ["ab:1"], "inscriptions": [PARENT, CHILD], "sat_balance": 1 });
+        assert_eq!(parse_ord_address(&addr), vec![PARENT.to_string(), CHILD.to_string()]);
+        assert!(parse_ord_inscription(&serde_json::json!({})).is_err());
     }
 
     #[test]
